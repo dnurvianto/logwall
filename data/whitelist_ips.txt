@@ -1,0 +1,9 @@
+# ==============================================================================
+# logwall — Admin Whitelist IP & Subnet List
+# Purpose: IP addresses and CIDR networks that must NEVER be blocked.
+# Note: Format: IP/CIDR (one per line). IPv4 and IPv6 are both supported.
+# Reference: docs/DESIGN.md §7 & §15.1
+# ==============================================================================
+
+127.0.0.1
+::1

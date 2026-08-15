@@ -1,0 +1,57 @@
+name: tests
+
+# The point of running these here is not that they are slow to run locally — they are not.
+# It is that a reviewer should never be the first thing a change meets. The machine says
+# whether the suites pass; a human then only has to judge whether the change is right.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported floor is Python 3.6, because AlmaLinux 8 ships 3.6 and dropping it
+        # would drop every RHEL 8 host. GitHub runners no longer offer 3.6, so the floor is
+        # verified by hand on real hosts (3.6.8 / 3.9 / 3.11 all pass) and what runs here is
+        # the range the runners can still provide.
+        python: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install firewall tooling
+        # gate_test.sh stubs every command it needs, but ipset and iptables must exist for
+        # the paths that probe for them to behave the way they do on a real host.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ipset iptables
+
+      - name: Line endings
+        # First, and deliberately so: CRLF makes Linux bash refuse to run a script at all,
+        # which turns every later failure into a misleading one.
+        run: bash tests/lineending_test.sh
+
+      - name: Smoke tests
+        run: python3 tests/smoke_test.py
+
+      - name: Gate tests
+        run: bash tests/gate_test.sh
+
+      - name: Syntax
+        run: |
+          for f in logwall preflight.sh install.sh uninstall.sh lib/*.sh tests/*.sh; do
+            bash -n "$f" || exit 1
+          done
+          python3 -m compileall -q lib/py tests

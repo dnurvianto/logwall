@@ -1,0 +1,20 @@
+# ==============================================================================
+# logwall — Dynamic Admin Hostnames (DDNS)
+# Purpose: Hostnames resolved on EVERY run and treated as admin whitelist entries.
+#          Use this when your admin IP changes (home ISP, tethering, VPN).
+# Fail-safe: if DNS is unreachable, the last successful answer is reused —
+#            a resolver outage never revokes your access.
+# Format: one hostname per line.
+# Reference: docs/DESIGN.md §15.2
+#
+# Free DDNS providers that work well here:
+#   DuckDNS     https://www.duckdns.org      (free, no expiry, popular on Linux)
+#   No-IP       https://www.noip.com         (free tier, 3 hostnames)
+#   Dynu        https://www.dynu.com         (free, stable)
+#   Cloudflare  your own domain + API updater script
+#
+# Whichever you pick, an updater must run on the machine you connect FROM,
+# otherwise the record goes stale and this file grants nothing.
+# ==============================================================================
+
+# myadmin.duckdns.org

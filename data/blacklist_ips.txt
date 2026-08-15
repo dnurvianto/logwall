@@ -1,0 +1,6 @@
+# ==============================================================================
+# logwall — Blacklist Attacker IP & Subnet Database
+# Purpose: Stores blocked malicious IPs with metadata comments.
+# Format: IP/CIDR    # YYYY-MM-DD HH:MM | Reason | HitCount
+# Reference: docs/DESIGN.md §7 & §10
+# ==============================================================================

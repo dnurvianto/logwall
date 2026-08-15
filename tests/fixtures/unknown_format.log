@@ -1,0 +1,3 @@
+Aug 12 21:00:01 srv kernel: [12345.678] something entirely unrelated
+Aug 12 21:00:02 srv kernel: [12346.789] still not a web access log
+Aug 12 21:00:03 srv kernel: [12347.890] no addresses here at all

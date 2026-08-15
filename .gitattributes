@@ -1,0 +1,5 @@
+# Every shipped file must reach Linux with LF endings. A CRLF file makes bash
+# refuse to run the script at all — including preflight.sh, the gate.
+* text=auto eol=lf
+*.png binary
+*.gz binary

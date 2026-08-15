@@ -1,0 +1,14 @@
+Aug 12 21:10:01 srv sshd[1234]: Failed password for root from 185.199.108.80 port 51234 ssh2
+Aug 12 21:10:04 srv sshd[1235]: Failed password for invalid user admin from 185.199.108.80 port 51236 ssh2
+Aug 12 21:10:07 srv sshd[1236]: Invalid user oracle from 185.199.108.80 port 51240
+Aug 12 21:10:09 srv sshd[1237]: error: maximum authentication attempts exceeded for root from 185.199.108.81 port 4022 ssh2 [preauth]
+Aug 12 21:10:12 srv sshd[1238]: Connection closed by authenticating user root 185.199.108.81 port 4023 [preauth]
+Aug 12 21:11:00 srv sshd[1240]: Accepted password for alice from 203.0.113.9 port 51999 ssh2
+Aug 12 21:11:02 srv sshd[1240]: pam_unix(sshd:session): session opened for user alice
+Aug 12 21:12:00 srv dovecot: imap-login: Aborted login (auth failed, 1 attempts in 3 secs): user=<test>, method=PLAIN, rip=185.199.108.82, lip=10.0.0.5
+Aug 12 21:12:30 srv dovecot: pop3-login: Disconnected (auth failed, 2 attempts in 5 secs): user=<x>, rip=185.199.108.82
+Aug 12 21:13:00 srv exim[900]: dovecot_login authenticator failed for (mail) [185.199.108.83]: 535 Incorrect authentication data
+Aug 12 21:14:00 srv sshd[1250]: Failed password for root from 2001:db8:beef::9 port 40000 ssh2
+Aug 12 21:20:00 srv dovecot: imap-login: Login aborted: Connection closed: read(size=704) failed: Connection reset by peer (no auth attempts in 4 secs) (no_auth_attempts): user=<>, rip=185.199.108.90, lip=10.0.0.5
+Aug 12 21:20:05 srv dovecot: imap-login: Authenticate NTLM failed: Unsupported authentication mechanism.: user=<>, method=NTLM, rip=185.199.108.91, lip=10.0.0.5
+Aug 12 21:20:09 srv sshd[1260]: Connection closed by 185.199.108.92 port 40100 [preauth]

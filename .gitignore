@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/state/*
+data/snapshot/*
+logs/*
+!data/state/.gitkeep
+!data/snapshot/.gitkeep
+!logs/.gitkeep

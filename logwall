@@ -1,0 +1,846 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Project: logwall — Cross-Distro & Cross-Panel Server Firewall Automation
+# Module: logwall (Main Executable CLI)
+# Purpose: Subcommand dispatcher and orchestrator for audit, apply, rollback,
+#          confirm, panic, report, status, unban, selftest, and version.
+# Reference: docs/DESIGN.md §7 (CLI & Operational Modes), §18 (Exit Codes)
+# ==============================================================================
+
+set -euo pipefail
+
+# cron runs with PATH=/usr/bin:/bin. ipset, iptables and ip live in /sbin and
+# /usr/sbin, so without this every scheduled cycle aborts on "ipset disappeared"
+# while a manual run from a login shell succeeds — the installation looks healthy
+# and does nothing at all.
+case ":${PATH}:" in
+    *:/sbin:*) ;;
+    *) PATH="/usr/local/sbin:/usr/local/bin:/sbin:/usr/sbin:${PATH}" ;;
+esac
+export PATH
+
+# ------------------------------------------------------------------ exit codes
+EXIT_OK=0
+EXIT_FINDINGS=1
+EXIT_CONFIG=2
+EXIT_NO_BACKEND=3
+EXIT_LOCKED=4
+EXIT_DEGRADED=5
+EXIT_BREAKER=6
+EXIT_ROLLED_BACK=10
+
+# Always resolve modules relative to this script, never to a stale copy.
+#
+# The symlink chain has to be followed by hand: invoked as /usr/local/bin/logwall,
+# BASH_SOURCE holds the symlink, so a plain dirname would look for lib/ inside
+# /usr/local/bin. `readlink -f` would do it in one line but does not exist on
+# busybox, so the loop below walks relative and absolute links alike.
+LOGWALL_SELF="${BASH_SOURCE[0]}"
+while [ -L "$LOGWALL_SELF" ]; do
+    _logwall_link="$(readlink "$LOGWALL_SELF")"
+    case "$_logwall_link" in
+        /*) LOGWALL_SELF="$_logwall_link" ;;
+        *)  LOGWALL_SELF="$(cd "$(dirname "$LOGWALL_SELF")" && pwd)/${_logwall_link}" ;;
+    esac
+done
+LOGWALL_ROOT="$(cd "$(dirname "$LOGWALL_SELF")" && pwd)"
+CONF_FILE="${LOGWALL_CONF:-/etc/logwall.conf}"
+
+if [ -f "$CONF_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$CONF_FILE"
+    set +a
+fi
+
+STATE_DIR="${STATE_DIR:-${LOGWALL_ROOT}/data/state}"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-${LOGWALL_ROOT}/data/snapshot}"
+DEADMAN_STATE_DIR="$STATE_DIR"
+export STATE_DIR SNAPSHOT_DIR PYTHONPATH="${LOGWALL_ROOT}/lib/py:${PYTHONPATH:-}"
+
+# naming.sh must come first: every other module reads the object names from it.
+# shellcheck source=lib/naming.sh
+. "${LOGWALL_ROOT}/lib/naming.sh"
+. "${LOGWALL_ROOT}/lib/system_discovery.sh"
+. "${LOGWALL_ROOT}/lib/process_lock.sh"
+. "${LOGWALL_ROOT}/lib/chain_manager.sh"
+. "${LOGWALL_ROOT}/lib/firewall_wrapper.sh"
+. "${LOGWALL_ROOT}/lib/rule_snapshot.sh"
+. "${LOGWALL_ROOT}/lib/cron_manager.sh"
+. "${LOGWALL_ROOT}/lib/deadman.sh"
+
+# --------------------------------------------------------------- flag handling
+QUIET=0
+DRY_RUN=0
+AS_JSON=0
+NO_CONFIRM=0
+FORCE_BREAKER=0
+REPAIR=0
+DEADMAN_RUN=0
+POSITIONAL=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --quiet)         QUIET=1 ;;
+        --dry-run)       DRY_RUN=1 ;;
+        --json)          AS_JSON=1 ;;
+        --no-confirm)    NO_CONFIRM=1 ;;
+        --force-breaker) FORCE_BREAKER=1 ;;
+        --repair)        REPAIR=1 ;;
+        --deadman)       DEADMAN_RUN=1 ;;
+        *)               POSITIONAL+=("$arg") ;;
+    esac
+done
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+
+run_system_discovery
+export PANEL_TYPE HAS_IPV6
+export SET_WHITE4 SET_BLACK4 SET_WHITE6 SET_BLACK6
+
+# ENFORCE gates every DROP rule. It ships disabled so a fresh installation can
+# never start dropping traffic before an operator has reviewed the candidates.
+ENFORCE="${ENFORCE:-0}"
+
+# ------------------------------------------------------------------- apply flow
+# Feeds newly detected addresses to CSF. CSF owns the blocklist in this mode, so
+# logwall installs no chains of its own — CSF flushes iptables on every reload and
+# would tear them out anyway.
+# Ref: docs/DESIGN.md §8.B
+_csf_push() {
+    local list_file="$1"
+    local pushed=0 failed=0 ip reason
+
+    [ -s "$list_file" ] || { say "[CSF] No new addresses to push."; return 0; }
+
+    # CSF enforces IPv6 only when its own IPV6 switch is on. Pushing an IPv6
+    # address to a CSF built without it lands the entry in csf.deny and never in
+    # ip6tables — recorded, reported as pushed, enforced by nobody. The same trap
+    # `csf -x` sets for IPv4, one family over.
+    local csf_v6=1
+    if [ -f /etc/csf/csf.conf ] && ! grep -qE '^IPV6[[:space:]]*=[[:space:]]*"?1"?' /etc/csf/csf.conf; then
+        csf_v6=0
+    fi
+
+    while IFS=$'\t' read -r ip reason || [ -n "${ip:-}" ]; do
+        [ -n "$ip" ] || continue
+        case "$ip" in
+            *:*)
+                if [ "$csf_v6" -eq 0 ]; then
+                    failed=$((failed + 1))
+                    echo "[ERROR] ${ip} not pushed: CSF has IPV6 disabled in csf.conf, so it would" >&2
+                    echo "[ERROR]   be written to csf.deny and never reach ip6tables." >&2
+                    echo "[ERROR]   Fix: set IPV6 = \"1\" in /etc/csf/csf.conf and run 'csf -r'." >&2
+                    continue
+                fi
+                ;;
+        esac
+        if csf -d "$ip" "${reason:-Blocked by logwall}" >/dev/null 2>&1; then
+            pushed=$((pushed + 1))
+        else
+            failed=$((failed + 1))
+            echo "[ERROR] csf -d failed for ${ip}" >&2
+        fi
+    done < "$list_file"
+
+    say "[CSF] Pushed ${pushed} address(es) to csf.deny; ${failed} failure(s)."
+    [ "$failed" -eq 0 ]
+}
+
+cmd_apply() {
+    local snapshot_id ipset_script python_rc=0 sessions_before csf_mode=0
+
+    [ "$FIREWALL_BACKEND" = "csf" ] && csf_mode=1
+
+    # Runtime gate. Conditions can appear long after installation — someone
+    # re-enables the old blocker, ipset gets removed, the config is edited into a
+    # collision. A blocker here means this cycle does not run at all.
+    if [ -f "${LOGWALL_ROOT}/preflight.sh" ]; then
+        # The report is captured, not printed. preflight's own footer talks about
+        # installing — the wrong advice mid-apply — and warnings here were already
+        # accepted at install time. Only a blocker is worth interrupting for.
+        local gate_out gate_rc=0
+        gate_out=$(bash "${LOGWALL_ROOT}/preflight.sh" --runtime --quiet 2>&1) || gate_rc=$?
+        if [ "$gate_rc" -eq 2 ]; then
+            echo "[ABORT] Runtime preflight found a blocker. No firewall rule was changed." >&2
+            printf '%s\n' "$gate_out" | grep -E '^\s*\[' >&2 || true
+            echo "[ABORT] Resolve it, then run: logwall doctor" >&2
+            return "$EXIT_CONFIG"
+        fi
+    fi
+
+    report_ipv6_exposure || true
+
+    # Recorded before anything changes, so the connectivity check can tell a real
+    # lockout apart from an unattended cron run that never had a session.
+    sessions_before=$(count_admin_sessions)
+
+    if [ "$csf_mode" -eq 1 ]; then
+        say "[INFO] CSF detected — coordination mode: blocks go through 'csf -d',"
+        say "[INFO] and logwall installs no chains or sets of its own."
+        if ! command -v csf >/dev/null 2>&1; then
+            echo "[ERROR] Backend is csf but the csf binary is missing." >&2
+            return "$EXIT_NO_BACKEND"
+        fi
+        # A pinned BACKEND=csf outlives `csf -x`. Pushing to a disabled CSF would
+        # record every block and enforce none of them.
+        if [ -f /etc/csf/csf.disable ]; then
+            echo "[ERROR] BACKEND=csf but CSF is disabled (/etc/csf/csf.disable exists)." >&2
+            echo "[ERROR] Blocks would be written to csf.deny and never enforced." >&2
+            echo "[ERROR] Re-enable it with 'csf -e', or switch BACKEND in ${CONF_FILE}." >&2
+            return "$EXIT_NO_BACKEND"
+        fi
+    elif ! fw_init_sets "${IPSET_MAXELEM:-262144}"; then
+        echo "[ERROR] Kernel set initialisation failed — aborting before any rule change." >&2
+        return "$EXIT_NO_BACKEND"
+    fi
+
+    snapshot_id=$(create_snapshot) || return "$EXIT_CONFIG"
+    say "[SNAPSHOT] ${snapshot_id}"
+
+    ipset_script="${STATE_DIR}/ipset_restore.script"
+    local csf_list="${STATE_DIR}/csf_push.list"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+    local py_args=()
+    if [ "$csf_mode" -eq 1 ]; then
+        py_args=(--emit-csf "$csf_list")
+    else
+        py_args=(--emit-ipset "$ipset_script")
+    fi
+    [ "$FORCE_BREAKER" -eq 1 ] && py_args+=(--force-breaker)
+    [ "$DRY_RUN" -eq 1 ] && py_args+=(--dry-run)
+
+    set +e
+    python3 "${LOGWALL_ROOT}/lib/py/apply_engine.py" "${py_args[@]}"
+    python_rc=$?
+    set -e
+
+    if [ "$python_rc" -eq "$EXIT_BREAKER" ]; then
+        echo "[ABORT] Circuit breaker tripped — no firewall rule was changed." >&2
+        return "$EXIT_BREAKER"
+    fi
+    if [ "$python_rc" -ne 0 ]; then
+        echo "[ERROR] Apply engine failed (exit ${python_rc}) — no firewall rule was changed." >&2
+        return "$EXIT_DEGRADED"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "[DRY-RUN] No kernel set or rule was modified."
+        return "$EXIT_OK"
+    fi
+
+    if [ "$csf_mode" -eq 1 ]; then
+        # `csf -d` writes a real block; there is no observe-only equivalent, so
+        # the push is the one action gated on ENFORCE in this mode.
+        if [ "$ENFORCE" = "1" ]; then
+            _csf_push "$csf_list" || say "[WARN] Some addresses could not be pushed to CSF."
+        else
+            # `grep -c` prints 0 and THEN exits 1, so `|| echo 0` would emit a
+            # second line and the message would break across two lines.
+            local pending
+            pending=$(grep -c . "$csf_list" 2>/dev/null || true)
+            say "[INFO] ENFORCE=0 — ${pending:-0} new address(es) recorded but NOT pushed to CSF."
+            say "[INFO] Review ${BLACKLIST:-/etc/logwall/blacklist_ips.txt}, then set ENFORCE=1."
+        fi
+    else
+        # Sets are always rebuilt, even in observe mode: inspecting the populated
+        # set is how an operator decides whether enforcement is safe to enable.
+        # Only the DROP rule itself is gated on ENFORCE (see setup_iptables_chains).
+        if ! fw_load_set_script "$ipset_script"; then
+            echo "[ERROR] Set reload failed — rolling back to ${snapshot_id}." >&2
+            restore_snapshot "$snapshot_id" || true
+            return "$EXIT_ROLLED_BACK"
+        fi
+
+        # Whitelist is installed before the blacklist can ever match.
+        setup_iptables_chains "$ENFORCE"
+
+        if [ "$ENFORCE" != "1" ]; then
+            say "[INFO] ENFORCE=0 — sets populated for review, no traffic is being dropped."
+            say "[INFO] Inspect: ipset list ${SET_BLACK4}   then set ENFORCE=1 in ${CONF_FILE}."
+        fi
+    fi
+
+    if ! verify_admin_connectivity "$sessions_before"; then
+        echo "[ERROR] Connectivity check failed — rolling back to ${snapshot_id}." >&2
+        restore_snapshot "$snapshot_id" || true
+        return "$EXIT_ROLLED_BACK"
+    fi
+
+    fw_save_rules "$OS_FAMILY" "$FIREWALL_BACKEND"
+
+    # The deadman protects against logwall's own rule changes locking the operator
+    # out. In CSF coordination mode logwall installs no rules at all, so there is
+    # nothing of ours to roll back — and firing it would restore a full ruleset
+    # snapshot, undoing whatever CSF legitimately did in the meantime. Arming it
+    # here would create the risk it exists to prevent.
+    if [ "$NO_CONFIRM" -eq 0 ] && [ "$csf_mode" -eq 0 ]; then
+        arm_deadman "$snapshot_id" "${CONFIRM_TIMEOUT_SEC:-300}" "${LOGWALL_ROOT}/logwall"
+    elif [ "$csf_mode" -eq 1 ]; then
+        say "[INFO] No deadman armed: in CSF mode logwall changes no rules, so there is"
+        say "[INFO] nothing to roll back. Releases happen with 'csf -dr <ip>'."
+    fi
+
+    say "[DONE] Apply completed (snapshot ${snapshot_id})."
+    return "$EXIT_OK"
+}
+
+# Checksum over the code that actually runs here, stable across hosts and
+# independent of install paths, mtimes, or config. Files are sorted so ordering
+# cannot shift the result.
+#
+# tests/ is excluded on purpose: it never executes in production, it is not
+# copied by a code sync, and counting it made two hosts running byte-identical
+# enforcement code report different fingerprints. A drift signal that fires on
+# something that cannot affect behaviour teaches operators to ignore it.
+_logwall_fingerprint() {
+    local sum
+    sum=$(cd "$LOGWALL_ROOT" 2>/dev/null && \
+          find . -type f \( -name '*.sh' -o -name '*.py' -o -name 'logwall' -o -name 'VERSION' \) \
+               ! -path './tests/*' ! -path './data/*' ! -path './logs/*' \
+               ! -path '*__pycache__*' 2>/dev/null |
+          LC_ALL=C sort |
+          xargs cat 2>/dev/null |
+          { md5sum 2>/dev/null || md5 2>/dev/null; } |
+          cut -c1-12)
+    echo "${sum:-unavailable}"
+}
+
+# ------------------------------------------------------------ bootstrap baseline
+# logwall is a denylist and never closes a port. But on a host with nothing in
+# front of it, refusing to install leaves zero protection while the operator
+# expected some — and CSF has shown for years that installing a sane default with
+# a self-healing timer is safe. This is that, made explicit: a command the
+# operator runs, not something preflight decides on their behalf.
+#
+# The port list is the union of everything that already knows the answer:
+#   1. any manager configuration still on disk — the operator's stated intent,
+#      and worth reading even when that manager no longer runs
+#   2. what is actually listening right now
+#   3. the ports nothing should lose (SSH above all)
+# Deriving beats a static default: on one host CSF's TCP_IN listed ports nobody
+# used and omitted 873, which was carrying traffic. Union rather than first-match
+# for the same reason — a stale config and a live socket each know something the
+# other does not, and a port opened in error is far cheaper than one lost.
+#
+# Set by _bootstrap_ports. Sources are named so the confirmation screen can say
+# what it actually read, instead of guessing from the backend name.
+BOOTSTRAP_PORTS=""
+BOOTSTRAP_PORT_SOURCES=""
+
+_bootstrap_ports() {
+    local ports="" got=""
+    BOOTSTRAP_PORTS=""
+    BOOTSTRAP_PORT_SOURCES=""
+
+    # Keyed on the config files themselves, never on FIREWALL_BACKEND. This
+    # command only runs when the detected backend is iptables or nftables —
+    # cmd_bootstrap_baseline refuses otherwise — so a `case` on the backend name
+    # could match csf/firewalld/ufw exactly never, and this entire block was
+    # unreachable while the comment above and the README both promised it worked.
+    # A leftover manager config on an otherwise bare host is precisely the
+    # operator intent worth reading, whether or not that manager still runs.
+    #
+    # Every capture below ends in `|| var=""`: grep and friends report "nothing
+    # matched" through their exit status, and under `set -euo pipefail` that
+    # would abort the run instead of simply yielding an empty list.
+    if [ -f /etc/csf/csf.conf ]; then
+        got=$(grep -E '^TCP_IN' /etc/csf/csf.conf |
+              sed 's/.*= *"//;s/".*//' | tr ',' ' ') || got=""
+        if [ -n "$got" ]; then
+            ports="${ports} ${got}"
+            BOOTSTRAP_PORT_SOURCES="${BOOTSTRAP_PORT_SOURCES}CSF config, "
+        fi
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        got=$(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' |
+              sed 's|/.*||' | tr '\n' ' ') || got=""
+
+        # --list-ports reports only ports added as bare numbers. Anything added
+        # the idiomatic way — `--add-service=http` — appears under
+        # --list-services instead, and on a normally configured firewalld host
+        # that is most of the ruleset. Measured on a live host: --list-ports
+        # returned 3456/tcp while the zone also carried cockpit, ssh and
+        # dhcpv6-client. Reading only the former would silently drop 80 and 443
+        # on any host whose operator used services, which is the documented way.
+        local svc svc_list svc_ports="" one
+        svc_list=$(firewall-cmd --list-services 2>/dev/null) || svc_list=""
+        for svc in $svc_list; do
+            one=$(firewall-cmd --info-service="$svc" 2>/dev/null |
+                  sed -n 's/^ *ports: *//p' | tr ' ' '\n' |
+                  sed 's|/.*||' | tr '\n' ' ') || one=""
+            svc_ports="${svc_ports} ${one}"
+        done
+        got="${got} ${svc_ports}"
+
+        if [ -n "$(printf '%s' "$got" | tr -d ' ')" ]; then
+            ports="${ports} ${got}"
+            BOOTSTRAP_PORT_SOURCES="${BOOTSTRAP_PORT_SOURCES}firewalld zones and services, "
+        fi
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        got=$(ufw status 2>/dev/null | grep -oE '^[0-9]+' | tr '\n' ' ') || got=""
+        if [ -n "$got" ]; then
+            ports="${ports} ${got}"
+            BOOTSTRAP_PORT_SOURCES="${BOOTSTRAP_PORT_SOURCES}ufw rules, "
+        fi
+    fi
+
+    # Whatever is listening, regardless of what any manager thinks.
+    if command -v ss >/dev/null 2>&1; then
+        got=$(ss -tlnH 2>/dev/null | awk '{print $4}' |
+              sed 's/.*://' | sort -un | tr '\n' ' ') || got=""
+        if [ -n "$got" ]; then
+            ports="${ports} ${got}"
+            BOOTSTRAP_PORT_SOURCES="${BOOTSTRAP_PORT_SOURCES}listening sockets, "
+        fi
+    fi
+
+    # SSH is not negotiable. 80/443 only if something is serving them.
+    ports="${ports} $(detect_ssh_port)"
+    BOOTSTRAP_PORT_SOURCES="${BOOTSTRAP_PORT_SOURCES}the SSH port"
+
+    # Result handed back through globals, not stdout. `ports=$(_bootstrap_ports)`
+    # would run this in a subshell, and BOOTSTRAP_PORT_SOURCES set in there
+    # never reaches the caller — the confirmation screen would silently go blank.
+    #
+    # Assigned rather than left as the closing pipeline for a second reason: a
+    # function whose last command is a grep that matches nothing returns 1, and
+    # `set -e` would kill the caller.
+    BOOTSTRAP_PORTS=$(printf '%s\n' $ports |
+                      grep -E '^[0-9]+$' | sort -un | tr '\n' ' ') || BOOTSTRAP_PORTS=""
+    return 0
+}
+
+cmd_bootstrap_baseline() {
+    local assume_yes="${1:-0}"
+
+    local policy
+    policy=$(iptables -S 2>/dev/null | awk '/^-P INPUT/ {print $3}')
+    if [ "$policy" = "DROP" ] || [ "$policy" = "REJECT" ]; then
+        echo "[BOOTSTRAP] INPUT policy is already ${policy} — this host has a baseline."
+        echo "[BOOTSTRAP] Nothing to do; logwall never rewrites a baseline it did not create."
+        return "$EXIT_OK"
+    fi
+    if [ "$FIREWALL_BACKEND" != "iptables" ] && [ "$FIREWALL_BACKEND" != "nftables" ]; then
+        echo "[BOOTSTRAP] '${FIREWALL_BACKEND}' is managing this host's firewall." >&2
+        echo "[BOOTSTRAP] Configure the baseline there — it owns the ruleset, not logwall." >&2
+        return "$EXIT_CONFIG"
+    fi
+
+    local ports ssh_port
+    _bootstrap_ports
+    ports="$BOOTSTRAP_PORTS"
+    ssh_port=$(detect_ssh_port)
+
+    echo "=== logwall bootstrap-baseline ==="
+    echo "  Derived from: ${BOOTSTRAP_PORT_SOURCES}"
+    echo "  Will ACCEPT : ${ports}"
+    echo "  Plus        : loopback · ESTABLISHED,RELATED · ICMP · every whitelisted source"
+    echo "  Then        : INPUT policy DROP"
+    echo
+    echo "  A service that happens to be stopped right now is NOT in that list."
+    echo "  Check it before answering."
+    echo
+
+    if [ "$assume_yes" -ne 1 ]; then
+        if [ ! -t 0 ]; then
+            echo "[BOOTSTRAP] No terminal to confirm on. Re-run with --yes if this list is right." >&2
+            return "$EXIT_CONFIG"
+        fi
+        printf "  Apply this baseline? [y/N] "
+        read -r reply
+        case "$reply" in [yY]*) ;; *) echo "[BOOTSTRAP] Declined; nothing changed."; return "$EXIT_OK" ;; esac
+    fi
+
+    local snapshot_id
+    snapshot_id=$(create_snapshot) || return "$EXIT_CONFIG"
+    echo "[SNAPSHOT] ${snapshot_id}"
+
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+        iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A INPUT -p icmp -j ACCEPT
+
+    local wl_file="${WHITELIST:-/etc/logwall/whitelist_ips.txt}" src
+    if [ -f "$wl_file" ]; then
+        while read -r src _; do
+            case "$src" in ''|'#'*|*:*) continue ;; esac
+            iptables -A INPUT -s "$src" -j ACCEPT 2>/dev/null || true
+        done < <(grep -vE '^[[:space:]]*(#|$)' "$wl_file")
+    fi
+
+    local p
+    for p in $ports; do
+        iptables -A INPUT -p tcp --dport "$p" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null ||
+            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+    done
+
+    iptables -P INPUT DROP
+    echo "[BOOTSTRAP] Applied: policy DROP with $(iptables -S INPUT | grep -c '^-A') rule(s)."
+
+    # The same deadman `apply` uses: if nobody confirms, the snapshot comes back
+    # and the host returns to exactly what it was.
+    arm_deadman "$snapshot_id" "${CONFIRM_TIMEOUT_SEC:-300}" "${LOGWALL_ROOT}/logwall"
+    echo "[BOOTSTRAP] Open a SECOND session and check you can still get in."
+    echo "[BOOTSTRAP] Then: logwall firewall confirm"
+    return "$EXIT_OK"
+}
+
+# ------------------------------------------------------------- selftest record
+# The scheduled selftest runs as `--quiet >/dev/null 2>&1`, so for a long time
+# every finding it produced was destroyed the moment it was printed — a monitor
+# whose output goes nowhere is decoration, not a monitor. Measured 15 Aug 2026:
+# what actually rebuilds torn-out chains is the 2-minute `firewall apply`, not
+# this job (docs/DESIGN.md §15.5). Its real value is drift detection, so the
+# result is now written to disk unconditionally: --quiet governs the console,
+# never the record.
+_selftest_record() {
+    local failures="$1" detail="$2"
+    local ts labels state_file log_file
+
+    ts=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+
+    # This file runs under `set -euo pipefail`. On a clean run grep matches
+    # nothing and exits 1, which pipefail promotes to a failed assignment and
+    # `set -e` turns into a silent abort — the recorder would then only ever
+    # work on hosts that already had a problem. Hence the explicit `|| true`.
+    labels=$(grep -E '^\[FAIL\]' "$detail" 2>/dev/null |
+             sed -E 's/^\[FAIL\] *//' | tr '\n' ';' | sed 's/;$//') || labels=""
+    [ -n "$labels" ] || labels="clean"
+
+    state_file="${STATE_DIR}/selftest.last"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s|%s|%s\n' "$ts" "$failures" "$labels" > "$state_file" 2>/dev/null || true
+    chmod 0640 "$state_file" 2>/dev/null || true
+
+    # Written as `if`, not `[ ... ] && return 0`: under `set -e` an && list that
+    # evaluates false is itself a failed command and would kill the caller.
+    if [ "$failures" -ne 0 ]; then
+        # Only failures are appended, so this file stays readable instead of
+        # accumulating one "all clear" block every ten minutes forever.
+        log_file="${REPORT_DIR:-/var/log/logwall}/selftest.log"
+        mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
+        {
+            echo "=== ${ts} — ${failures} check(s) failed ==="
+            grep -E '^\[FAIL\]' "$detail" 2>/dev/null || true
+        } >> "$log_file" 2>/dev/null || true
+        chmod 0640 "$log_file" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------- selftest
+cmd_selftest() {
+    local failures=0 detail
+
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    detail=$(mktemp 2>/dev/null) || detail="${STATE_DIR}/selftest.tmp.$$"
+
+    # Everything is captured rather than printed straight out, so the same text
+    # can reach the console, the state file and the failure log without any of
+    # the three being able to swallow the other two.
+    {
+        echo "[SELFTEST] backend=${FIREWALL_BACKEND} distro=${OS_DISTRO} init=${INIT_SYSTEM} ipv6=${HAS_IPV6}"
+
+        # A fleet gets patched file by file, and a version string alone cannot tell
+        # two hosts apart when only a library changed underneath it. The fingerprint
+        # is a checksum over the shipped code, so identical output across hosts means
+        # identical code — and a mismatch is visible without hunting for it.
+        echo "[SELFTEST] version=$(cat "${LOGWALL_ROOT}/VERSION" 2>/dev/null || echo unknown) fingerprint=$(_logwall_fingerprint)"
+
+        if [ "$REPAIR" -eq 1 ]; then
+            if [ "$FIREWALL_BACKEND" != "csf" ]; then
+                fw_init_sets "${IPSET_MAXELEM:-262144}" || true
+                setup_iptables_chains "$ENFORCE"
+            fi
+            deadman_check_stale "${CONFIRM_TIMEOUT_SEC:-300}" "${LOGWALL_ROOT}/logwall" || true
+        fi
+
+        set +e
+        naming_guard || failures=$((failures + 1))
+        if [ "$FIREWALL_BACKEND" = "csf" ]; then
+            # Coordination mode owns no chains and no sets by design; checking for
+            # them would report a permanent, meaningless failure.
+            echo "[INFO] CSF coordination mode — logwall owns no chains or sets here."
+            command -v csf >/dev/null 2>&1 && echo "[ OK ] csf binary present"             || { echo "[FAIL] backend is csf but the binary is missing"; failures=$((failures + 1)); }
+        else
+            chain_selftest "$ENFORCE"
+            failures=$((failures + $?))
+        fi
+        cron_selftest || failures=$((failures + 1))
+        detect_foreign_blockers || echo "[INFO] Coexisting agent detected (reported, not modified)."
+        report_ipv6_exposure || true
+        set -e
+    } > "$detail" 2>&1
+
+    [ "$QUIET" -eq 1 ] || cat "$detail"
+    _selftest_record "$failures" "$detail" || true
+    rm -f "$detail"
+
+    if [ "$failures" -ne 0 ]; then
+        echo "[SELFTEST] ${failures} check(s) failed." >&2
+        return "$EXIT_FINDINGS"
+    fi
+
+    say "[SELFTEST] All checks passed."
+    return "$EXIT_OK"
+}
+
+# --------------------------------------------------------------------- unban
+cmd_unban() {
+    local ip="$1"
+    local blacklist="${BLACKLIST:-/etc/logwall/blacklist_ips.txt}"
+    local tmp
+
+    fw_unblock_ip "$ip" "$FIREWALL_BACKEND" || return "$EXIT_CONFIG"
+
+    if [ -f "$blacklist" ]; then
+        tmp=$(mktemp)
+        # Exact match on the first field only: an IPv4 address is a regex if fed
+        # to sed, and a substring match would delete unrelated neighbours.
+        awk -v target="$ip" '$1 != target' "$blacklist" > "$tmp"
+        cat "$tmp" > "$blacklist"
+        rm -f "$tmp"
+    fi
+
+    fw_save_rules "$OS_FAMILY" "$FIREWALL_BACKEND"
+    echo "[INFO] Unbanned ${ip} and removed it from the blacklist."
+    return "$EXIT_OK"
+}
+
+# -------------------------------------------------------------------- status
+cmd_status() {
+    echo "=== logwall status ==="
+    echo "OS Distro       : ${OS_DISTRO} (${OS_FAMILY})"
+    echo "Init System     : ${INIT_SYSTEM}"
+    # One detected value used to be printed as "Backend", which read as though
+    # logwall enforced *through* firewalld or ufw. It never did: enforcement is
+    # either CSF coordination or logwall's own chains, and everything else in that
+    # list only says who owns boot persistence. Two lines, two questions.
+    if [ "$FIREWALL_BACKEND" = "csf" ]; then
+        echo "Enforcement via : CSF coordination — blocks pushed with 'csf -d', logwall owns no chains"
+    else
+        echo "Enforcement via : logwall chains + ipset (standalone layer)"
+    fi
+    echo "Persistence by  : ${FIREWALL_BACKEND}"
+    echo "Control Panel   : ${PANEL_TYPE}"
+
+    # "IPv6 Enabled: 1" said only that the host has an address — not whether
+    # anything filters that family. A host can show 1, carry armed LOGWALL_BL6
+    # chains, and still accept every IPv6 connection on earth.
+    if [ "${HAS_IPV6:-0}" != "1" ]; then
+        echo "IPv6            : no global address on this host — nothing to cover"
+    elif check_ipv6_exposure; then
+        echo "IPv6            : covered by logwall, and the host has an IPv6 firewall"
+    else
+        echo "IPv6            : covered by logwall (same as IPv4)"
+        echo "                  ⚠ but THIS HOST has no IPv6 firewall — every IPv6 port"
+        echo "                    is open to the internet. That is not logwall's doing;"
+        echo "                    a denylist cannot close a port nobody filters."
+    fi
+    echo "Enforcement     : $([ "$ENFORCE" = "1" ] && echo 'ON (dropping)' || echo 'OFF (observe only)')"
+
+    if fw_have_ipset; then
+        echo "${SET_WHITE4}      : $(fw_set_count "$SET_WHITE4") entries"
+        echo "${SET_BLACK4}      : $(fw_set_count "$SET_BLACK4") entries"
+        if [ "${HAS_IPV6:-0}" = "1" ]; then
+            echo "${SET_WHITE6}      : $(fw_set_count "$SET_WHITE6") entries"
+            echo "${SET_BLACK6}      : $(fw_set_count "$SET_BLACK6") entries"
+        fi
+    else
+        echo "ipset           : NOT INSTALLED"
+    fi
+
+    # The scheduled selftest is the only thing watching for drift — duplicate
+    # jumps, a cron entry that went missing, a blocking agent that appeared
+    # after installation. Its findings used to go to /dev/null, so surfacing the
+    # last result here is what turns it from decoration into something an
+    # operator can act on.
+    if [ -r "${STATE_DIR}/selftest.last" ]; then
+        local st_ts st_fail st_labels
+        IFS='|' read -r st_ts st_fail st_labels < "${STATE_DIR}/selftest.last"
+        if [ "${st_fail:-1}" = "0" ]; then
+            echo "Last selftest   : ${st_ts} — clean"
+        else
+            echo "Last selftest   : ${st_ts} — ${st_fail} FAILED"
+            echo "                  ${st_labels}"
+            echo "                  detail: ${REPORT_DIR:-/var/log/logwall}/selftest.log"
+        fi
+    else
+        echo "Last selftest   : never recorded — run 'logwall selftest'"
+    fi
+
+    if [ -f "${DEADMAN_STATE_DIR}/deadman.marker" ]; then
+        echo "Pending confirm : YES — run 'logwall firewall confirm'"
+    fi
+
+    echo
+    echo "--- coexistence ---"
+    detect_foreign_blockers || true
+    report_ipv6_exposure || true
+    return "$EXIT_OK"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: logwall <command> [options]
+
+  firewall audit                 Read-only detection report (no changes)
+  firewall apply                 Apply blacklist; arms a deadman rollback
+  firewall confirm               Confirm the last apply, cancel the deadman
+  firewall rollback <SNAPSHOT>   Restore a snapshot (verified)
+  firewall unban <IP>            Manual release of a blocked address
+  firewall report                Generate the daily summary report
+  firewall status                Show backend, sets, enforcement, coexistence
+  firewall panic                 EMERGENCY: detach every logwall hook
+  bootstrap-baseline [--yes]     Create a default-deny baseline on a host that has
+                                   none: derives the port list from an existing
+                                   manager, from what is listening, and from the
+                                   SSH port; confirms it; arms a deadman.
+                                   Refuses if a baseline or a manager already exists.
+  doctor                         Full environment gate (same one install.sh must pass)
+                                   exit 0 READY · 1 WARNINGS · 2 BLOCKED
+  selftest [--repair]            Verify (and optionally repair) hooks and sets
+  version                        Print version and detected environment
+
+Options: --quiet  --dry-run  --json  --no-confirm  --force-breaker
+EOF
+}
+
+# ------------------------------------------------------------------- dispatch
+SUBCOMMAND="${1:-audit}"
+shift || true
+
+case "$SUBCOMMAND" in
+    firewall)
+        ACTION="${1:-audit}"
+        shift || true
+
+        case "$ACTION" in
+            audit)
+                say "=== logwall audit (read-only) ==="
+                say "backend=${FIREWALL_BACKEND} panel=${PANEL_TYPE} ipv6=${HAS_IPV6} enforce=${ENFORCE}"
+                audit_args=()
+                [ "$AS_JSON" -eq 1 ] && audit_args+=(--json)
+                set +e
+                python3 "${LOGWALL_ROOT}/lib/py/audit_engine.py" ${audit_args[@]+"${audit_args[@]}"}
+                rc=$?
+                set -e
+                exit "$rc"
+                ;;
+
+            apply)
+                acquire_lock "${LOCK_FILE:-/var/lock/logwall.lock}" "${LOCK_STALE_MIN:-30}"
+                # Runs on every exit path, including failure, so snapshots can
+                # never accumulate unbounded when an apply aborts.
+                trap 'prune_snapshots "${SNAPSHOT_RETENTION:-30}"; release_lock' EXIT
+                set +e
+                cmd_apply
+                rc=$?
+                set -e
+                exit "$rc"
+                ;;
+
+            confirm)
+                confirm_deadman
+                exit "$EXIT_OK"
+                ;;
+
+            rollback)
+                SNAP="${1:-}"
+                if [ -z "$SNAP" ]; then
+                    SNAP=$(latest_snapshot)
+                    [ -n "$SNAP" ] && echo "[INFO] No snapshot given, using latest: ${SNAP}"
+                fi
+                if [ -z "$SNAP" ]; then
+                    echo "[ERROR] No snapshot available to restore." >&2
+                    exit "$EXIT_CONFIG"
+                fi
+                set +e
+                restore_snapshot "$SNAP"
+                rc=$?
+                set -e
+                [ "$DEADMAN_RUN" -eq 1 ] && rm -f "${DEADMAN_STATE_DIR}/deadman.marker"
+                exit "$rc"
+                ;;
+
+            unban)
+                IP="${1:-}"
+                if [ -z "$IP" ]; then
+                    echo "[ERROR] Usage: logwall firewall unban <ip>" >&2
+                    exit "$EXIT_CONFIG"
+                fi
+                cmd_unban "$IP"
+                exit $?
+                ;;
+
+            report)
+                python3 "${LOGWALL_ROOT}/lib/py/report_gen.py"
+                exit "$EXIT_OK"
+                ;;
+
+            status)
+                cmd_status
+                exit $?
+                ;;
+
+            panic)
+                echo "[EMERGENCY] Detaching every logwall hook..."
+                panic_remove_chains
+                rm -f "${DEADMAN_STATE_DIR}/deadman.marker" 2>/dev/null || true
+                echo "[EMERGENCY] Done. logwall no longer touches this ruleset."
+                echo "[EMERGENCY] Other tools' rules (panel, CSF, fail2ban, Docker) were left intact."
+                exit "$EXIT_OK"
+                ;;
+
+            *)
+                usage
+                exit "$EXIT_CONFIG"
+                ;;
+        esac
+        ;;
+
+    doctor)
+        # Full environment gate, identical to the one install.sh must pass.
+        doctor_args=()
+        [ "$AS_JSON" -eq 1 ] && doctor_args+=(--json)
+        [ "$QUIET" -eq 1 ] && doctor_args+=(--quiet)
+        exec bash "${LOGWALL_ROOT}/preflight.sh" ${doctor_args[@]+"${doctor_args[@]}"}
+        ;;
+
+    bootstrap-baseline)
+        BOOTSTRAP_YES=0
+        for a in "$@"; do [ "$a" = "--yes" ] && BOOTSTRAP_YES=1; done
+        cmd_bootstrap_baseline "$BOOTSTRAP_YES"
+        exit $?
+        ;;
+
+    selftest)
+        cmd_selftest
+        exit $?
+        ;;
+
+    version)
+        VER=$(cat "${LOGWALL_ROOT}/VERSION" 2>/dev/null || echo "unknown")
+        echo "logwall ${VER}"
+        echo "  distro=${OS_DISTRO} family=${OS_FAMILY} init=${INIT_SYSTEM}"
+        echo "  backend=${FIREWALL_BACKEND} panel=${PANEL_TYPE} ipv6=${HAS_IPV6}"
+        echo "  enforce=${ENFORCE} ipset=$(fw_have_ipset && echo yes || echo no)"
+        exit "$EXIT_OK"
+        ;;
+
+    help|--help|-h)
+        usage
+        exit "$EXIT_OK"
+        ;;
+
+    *)
+        usage
+        exit "$EXIT_CONFIG"
+        ;;
+esac

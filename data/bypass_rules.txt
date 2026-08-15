@@ -1,0 +1,8 @@
+# ==============================================================================
+# logwall — Bypass Rules & Trusted Bots Network List
+# Purpose: Search engine crawlers and CDN ranges that should bypass rate limits.
+# Reference: docs/DESIGN.md §7 & §11
+# ==============================================================================
+
+# Googlebot default subnet range (Fast-path cache)
+66.249.64.0/19
