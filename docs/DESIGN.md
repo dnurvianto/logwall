@@ -930,9 +930,27 @@ below close that gap.
 
 1. **File locking.** The `*/2` cron, a manual `apply`, the weekly `review` and the monitor can
    all overlap. Two processes writing the ipset and `ip_blacklist.txt` at once → a corrupt file
-   or a half-built set. Every subcommand that writes must take `flock $LOCK_FILE`; failing to
+   or a half-built set. Every **writer** must take `flock $LOCK_FILE`; failing to
    acquire it means exit 4 (never queue, never force). A lock older than `LOCK_STALE_MIN` is
    treated as crash residue, cleaned up with a WARN.
+
+   > **This rule said "every subcommand that writes", and that wording had a hole.**
+   > `uninstall.sh` is a separate script rather than a `logwall` subcommand, so it was never
+   > covered — while being the most destructive writer in the project. Measured on a busy
+   > host: a cron `apply` began in the same second as an uninstall. The uninstall detached
+   > the hooks, deleted the chains, destroyed the sets and verified itself clean — correctly,
+   > at the instant it looked. One second later the in-flight `apply` rebuilt the chains and
+   > sets, and the host was left with orphaned chains that the next preflight refused to
+   > install over, reporting them as another tool's.
+   >
+   > Both halves of the failure are worth naming. The verification was not wrong; it was
+   > **outrun** — proof that checking at the end is no substitute for holding the lock
+   > throughout. And the hole existed because the rule was written in terms of the CLI's
+   > shape rather than in terms of who writes.
+   >
+   > `uninstall.sh` now takes the lock before touching anything, cron removal included: an
+   > apply already running means nothing has changed yet, so exiting is free, and an apply
+   > that fires while the lock is held exits without rebuilding a thing.
 
 2. **Per-inode log cursors.** Without them, reading a "24-hour window" every 2 minutes means
    **the same request is counted 720 times a day** — an already-blocked address keeps appearing

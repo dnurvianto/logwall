@@ -28,6 +28,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/naming.sh
 . "${SCRIPT_DIR}/lib/naming.sh"
 
+# DESIGN 16.1 requires every writer to hold the lock. This was the one that never
+# did — being a separate script rather than a `logwall` subcommand, it slipped
+# past the rule while being the most destructive writer there is.
+#
+# Measured on a busy host: a cron apply started in the same second as an
+# uninstall. The uninstall detached the hooks, deleted the chains, destroyed the
+# sets and verified itself clean — correctly, at the instant it looked. One
+# second later the in-flight apply rebuilt the chains and sets from its own run.
+# The host was left with orphaned chains, and the next preflight refused to
+# install over them, reporting them as belonging to another tool.
+#
+# The lock is taken before anything is touched, cron removal included. An apply
+# already running means nothing has changed yet, so exiting is free and the
+# operator simply retries. An apply that fires while we hold it will fail to
+# acquire and exit without rebuilding a thing.
+if [ -f "${SCRIPT_DIR}/lib/process_lock.sh" ]; then
+    # shellcheck source=lib/process_lock.sh
+    . "${SCRIPT_DIR}/lib/process_lock.sh"
+    acquire_lock "${LOCK_FILE:-/var/lock/logwall.lock}" "${LOCK_STALE_MIN:-30}"
+    trap 'release_lock' EXIT
+fi
+
 if [ -f "${SCRIPT_DIR}/lib/cron_manager.sh" ]; then
     # shellcheck source=lib/cron_manager.sh
     . "${SCRIPT_DIR}/lib/cron_manager.sh"
