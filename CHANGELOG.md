@@ -2,6 +2,104 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc10 — 2026-08-16 (IPv6 counted correctly; scope tightened)
+
+Everything here came from one thing: installing on a host that had never seen this
+tool, on a stack none of the others used — Ubuntu 24.04, ufw, CyberPanel's cousin
+FastPanel, and real IPv6 traffic. Four defects, none of them findable by reading
+the code.
+
+### IPv6 was counted per address, not per /64
+
+`IPV6_BLOCK_PREFIX=64` was documented in the config and twice in §14, and no code
+read it. A /64 is the block a customer is actually handed, and privacy extensions
+rotate the host portion every few hours by default on essentially every modern OS.
+
+Measured: six rotations at 200 hits each produced six keys of 200 against a
+threshold of 400. Twelve hundred requests from one visitor, nothing detected.
+Blocking inherited the same fault — a `/128` entry is obsolete the moment the
+client rotates, while the `/64` holds.
+
+Counting now happens per `/64`, which lands in four places: window keys become
+CIDRs, the guard judges them by overlap rather than membership (a `/64` holding
+one whitelisted address is refused whole), the subnet rollup takes the network
+part before re-aggregating, and state written before the change folds its bare
+keys on load. That last part matters: without it a source is counted twice for a
+full window and neither key necessarily crosses a threshold the total already
+had. `IPV6_BLOCK_PREFIX=128` restores per-address counting.
+
+### A single IPv6 source arrived as seventy candidates
+
+Because a `/64` is the analogue of one IPv4 address, a crawler taking one address
+out of each of its `/64`s aggregates to nothing: every network holds exactly one
+member, far below `SUBNET_MIN_IPS`.
+
+Measured on that host — a crawler presenting 82 addresses shaped
+`2a03:2880:f800:XX::`, roughly 3,000 hits each:
+
+```
+before   75 candidates, MAX_NEW_BLOCKS_PER_RUN exceeded,
+         [ABORT] Circuit breaker tripped — no firewall rule was changed
+after     6 candidates
+         2a03:2880:f800::/56   Subnet6Flood | 70 /64s | Hits: 220783x
+```
+
+The IPv4 side has always behaved correctly here; the million-request incident in
+the README collapses to two candidates because `/24` rollup does its job. IPv6 had
+no equivalent tier. It now aggregates at `/56` once `SUBNET6_WIDE_MIN_PREFIXES`
+(8) distinct `/64`s show the same behaviour — `/56` rather than `/48` because the
+measured distribution fit entirely inside a `/56`, and `/48` is 256× wider for no
+additional reach. A `/56` holds 256 `/64`s, the same factor a `/24` aggregates for
+IPv4, which keeps the two families symmetrical. `/56` is a hard ceiling.
+
+`MAX_NEW_BLOCKS_PER_RUN` 50 → 100 as headroom, not as the fix. The config says so:
+raising it far higher would blunt the guard that exists to catch parser faults,
+which is the only reason it exists.
+
+### The parser crashed on the one path meant to protect the host
+
+Python accepts a text-mode `seek()` only for offset 0 or a value `tell()` returned.
+An arbitrary byte position leaves the reader in a state where the next `tell()`
+raises. The byte budget computes exactly such an offset:
+
+```python
+if current_size - offset > budget:
+    offset = current_size - budget
+```
+
+So the path meant to stop an enormous backlog from exhausting a host was the path
+that crashed when a backlog arrived — §16.2 promises a cap and delivered a
+traceback. Reproduced on Python 3.8, 3.11 and 3.12; never version-specific.
+
+Reading is now binary with an arithmetic cursor, which also closes a quieter
+fault: `len()` on a text line counts CHARACTERS, so every non-ASCII byte made the
+byte count drift below the true position — and that number is both the budget and
+the saved cursor.
+
+### Scope: fleet sync did not belong in the tree
+
+The README lists fleet sync as roadmap item 5, deliberately outside 1.0. The tree
+shipped `lib/py/fleet_sync.py` anyway — referenced by no CLI path, yet covered by
+tests — and §7 and §19 documented two commands the CLI has never implemented.
+
+Half-finished scope that ships without being reachable is not inert: it was
+reached for during a host migration and used to attempt the one thing this project
+explicitly refuses to do, which 1.4.0 removed `import-legacy` to prevent. The
+module is gone, the phantom commands are gone from §7, and §19 states the boundary
+plainly. Migrating another tool's blocklist is sysadmin work; preflight reports
+what it found and names the command to secure the data, and the admin decides.
+
+### Also
+
+CSF's own sets are no longer reported as `[FOREIGN]` in coordination mode.
+`preflight` already excluded them; `selftest`, `apply` and `status` did not, so the
+chosen configuration was announced as something unexpected — `chain_DENY` is
+precisely where logwall's own blocks land there. Third instance of one asymmetry
+this release: a code path that knows about CSF coordination beside one that does
+not.
+
+144 smoke checks (was 132), gate 72/72.
+
 ## 1.0.0-rc9 — 2026-08-15 (two defects found by migrating four production hosts)
 
 Both were found by running the tool, not by reading it, and one of them cost a
