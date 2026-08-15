@@ -6,6 +6,7 @@ Exercises the detection pipeline against synthetic logs in a temp directory.
 Touches no firewall, no kernel set, and no system path — safe to run anywhere.
 Usage: python3 tests/smoke_test.py
 """
+import json
 import os
 import shutil
 import sys
@@ -247,7 +248,15 @@ check("fmt nginx: bandwidth summed", m["bw"].get("185.199.108.10") == 5120 + 512
       m["bw"].get("185.199.108.10"))
 check("fmt nginx: 401 counted for panel brute force",
       m["panel_401"].get("185.199.108.10") == 1)
-check("fmt nginx: bare IPv6 client parsed", m["hits"].get("2606:4700:20::1") == 1,
+# The key is the /64, not the address: IPV6_BLOCK_PREFIX collapses IPv6 to the
+# block a customer is actually handed. Both halves are asserted — the /64 carries
+# the count AND the bare address is gone — so a silent regression to per-/128
+# counting cannot pass.
+check("fmt nginx: bare IPv6 client parsed, counted as its /64",
+      m["hits"].get("2606:4700:20::/64") == 1,
+      [k for k in m["hits"] if ":" in k])
+check("fmt nginx: the /128 is NOT counted separately",
+      "2606:4700:20::1" not in m["hits"],
       [k for k in m["hits"] if ":" in k])
 
 # The FastPanel backend format carries ONE placeholder instead of two. Positional
@@ -313,7 +322,8 @@ check("auth: sshd failed passwords counted", af.get("185.199.108.80") == 3, af)
 check("auth: preauth/max-attempts variants counted", af.get("185.199.108.81") == 2, af)
 check("auth: dovecot IMAP/POP3 failures counted", af.get("185.199.108.82") == 2, af)
 check("auth: exim SMTP AUTH failure counted", af.get("185.199.108.83") == 1, af)
-check("auth: IPv6 attacker counted", af.get("2001:db8:beef::9") == 1, af)
+check("auth: IPv6 attacker counted, keyed by /64",
+      af.get("2001:db8:beef::/64") == 1, af)
 check("auth: a SUCCESSFUL login never counts",
       af.get("203.0.113.9", 0) == 0, af.get("203.0.113.9", 0))
 # Entries are created with every metric zeroed, so the web counters legitimately
@@ -597,6 +607,55 @@ check("subnet: below the breaker limit, so blocking actually happens",
 check("subnet: a lone heavy host is blocked as a HOST, not as its /24",
       "185.199.9.99" in verdict and "185.199.9.0/24" not in verdict,
       [k for k in verdict if k.startswith("185.199.9")])
+
+# ---- IPv6 counted per /64: a rotating client is one visitor ----------------
+# Privacy extensions rotate the host portion every few hours by default, so per
+# address counting splits one visitor across many keys and none of them reaches
+# the threshold. Before this, six rotations at 200 hits each produced six keys of
+# 200 against a threshold of 400 — 1,200 requests, nothing detected.
+rot_state = os.path.join(work, "rot_state")
+os.makedirs(rot_state, exist_ok=True)
+rot_cfg = dict(cfg); rot_cfg["STATE_DIR"] = rot_state
+rot = log_parser.LogParserEngine(rot_cfg)
+for host in range(6):
+    for _ in range(200):
+        rot.window.add("2001:db8:abcd:1234:%x::1" % host, "hits", 1, now_ts)
+
+check("v6 /64: six rotating addresses collapse to ONE counter",
+      len(rot.window.entries) == 1, list(rot.window.entries)[:3])
+check("v6 /64: the counter holds every request the visitor made",
+      rot.window.entries.get("2001:db8:abcd:1234::/64", {}).get("hits") == 1200,
+      rot.window.entries.get("2001:db8:abcd:1234::/64", {}).get("hits"))
+
+# The escape hatch has to work, or a host with unusual v6 allocation is stuck.
+per_state = os.path.join(work, "per_state")
+os.makedirs(per_state, exist_ok=True)
+per_cfg = dict(cfg); per_cfg["STATE_DIR"] = per_state; per_cfg["IPV6_BLOCK_PREFIX"] = "128"
+per = log_parser.LogParserEngine(per_cfg)
+for host in range(6):
+    per.window.add("2001:db8:abcd:1234:%x::1" % host, "hits", 200, now_ts)
+check("v6 /64: IPV6_BLOCK_PREFIX=128 restores per-address counting",
+      len(per.window.entries) == 6, len(per.window.entries))
+
+# A state file written before the change must fold on load, or one source is
+# counted twice for a whole window — once under its old bare key, once under the
+# /64 — and neither necessarily crosses a threshold the total would have.
+mig_state = os.path.join(work, "mig_state")
+os.makedirs(mig_state, exist_ok=True)
+with open(os.path.join(mig_state, "window.json"), "w", encoding="utf-8") as fh:
+    json.dump({"ips": {
+        "2001:db8:aaaa:1::5":  {"hits": 300, "first": now_ts, "last": now_ts},
+        "2001:db8:aaaa:1::99": {"hits": 250, "first": now_ts, "last": now_ts},
+        "185.199.108.10":      {"hits": 10,  "first": now_ts, "last": now_ts},
+    }}, fh)
+mig_cfg = dict(cfg); mig_cfg["STATE_DIR"] = mig_state
+mig = log_parser.LogParserEngine(mig_cfg)
+check("v6 /64: an old state file folds its bare keys into the /64 on load",
+      mig.window.entries.get("2001:db8:aaaa:1::/64", {}).get("hits") == 550,
+      dict(mig.window.entries))
+check("v6 /64: folding leaves IPv4 keys untouched",
+      mig.window.entries.get("185.199.108.10", {}).get("hits") == 10,
+      list(mig.window.entries))
 
 # ---- second-tier IPv6 rollup: one address per /64 ---------------------------
 # /64 is IPv6's single-allocation unit — the analogue of ONE IPv4 address. A

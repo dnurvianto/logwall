@@ -126,7 +126,8 @@ IP_TOKEN_RE = re.compile(
 class TrafficWindow:
     """Persistent per-IP counters with a time-to-live of WINDOW_HOURS."""
 
-    def __init__(self, state_dir, window_hours=24, max_ips=200000):
+    def __init__(self, state_dir, window_hours=24, max_ips=200000, v6_prefix=64):
+        self.v6_prefix = v6_prefix
         self.path = os.path.join(state_dir, "window.json")
         self.state_dir = state_dir
         self.window_seconds = max(1, window_hours) * 3600
@@ -141,10 +142,62 @@ class TrafficWindow:
                     data = json.load(f)
                 if isinstance(data, dict):
                     self.entries = data.get("ips", {})
+                    self._migrate_v6_keys()
             except (OSError, ValueError):
                 self.entries = {}
 
+    def _migrate_v6_keys(self):
+        """
+        Folds pre-existing per-address IPv6 counters into their /64.
+
+        Without this, a state file written before IPV6_BLOCK_PREFIX took effect
+        keeps its bare-address keys for a full window while new traffic lands
+        under the /64 — one source counted twice, and neither key necessarily
+        crossing a threshold the combined total would have crossed. Observed on
+        a live host mid-deploy: 174 old keys beside 44 new ones, and a range
+        reason that read "114 /64s" for 70 actual networks.
+        """
+        if self.v6_prefix >= 128:
+            return
+        merged = {}
+        for key, entry in self.entries.items():
+            new_key = self._collapse_v6(key)
+            existing = merged.get(new_key)
+            if existing is None:
+                merged[new_key] = entry
+                continue
+            for metric in METRIC_KEYS:
+                existing[metric] = existing.get(metric, 0) + entry.get(metric, 0)
+            existing["first"] = min(existing.get("first", 0), entry.get("first", 0))
+            existing["last"] = max(existing.get("last", 0), entry.get("last", 0))
+        self.entries = merged
+
+    def _collapse_v6(self, ip_str):
+        """
+        Counts IPv6 per /64 — the block a customer is actually handed.
+
+        A residential or mobile client owns an entire /64 and rotates addresses
+        inside it freely; privacy extensions do so every few hours by default.
+        Counting per /128 therefore splits one visitor across many keys: measured
+        on a synthetic rotation of six addresses at 200 hits each, no single key
+        reached the 400-hit threshold while the source had made 1,200 requests.
+        The /24 equivalent for IPv4 does not exist here — a /64 IS the address.
+
+        Blocking follows counting, which is the point: a /128 entry is obsolete
+        the moment the client rotates, while the /64 holds.
+
+        `IPV6_BLOCK_PREFIX=128` restores per-address behaviour.
+        """
+        if ":" not in ip_str or "/" in ip_str or self.v6_prefix >= 128:
+            return ip_str
+        try:
+            return str(ipaddress.ip_network(
+                "{}/{}".format(ip_str, self.v6_prefix), strict=False))
+        except ValueError:
+            return ip_str
+
     def add(self, ip, metric, value, now):
+        ip = self._collapse_v6(ip)
         entry = self.entries.get(ip)
         if entry is None:
             entry = {key: 0 for key in METRIC_KEYS}
@@ -196,10 +249,13 @@ class TrafficWindow:
                     continue
                 key = "{}.{}.{}.0/24".format(*octets[:3])
             else:
+                # v6 keys already arrive as /64 CIDRs (IPV6_BLOCK_PREFIX), so the
+                # network part is taken before re-aggregating at the wider prefix.
+                base = ip_str.split("/", 1)[0]
                 try:
                     key = str(ipaddress.ip_network(
-                        "{}/{}".format(ip_str,
-                                       prefix_v4 if "." in ip_str and ":" not in ip_str
+                        "{}/{}".format(base,
+                                       prefix_v4 if "." in base and ":" not in base
                                        else prefix_v6),
                         strict=False))
                 except ValueError:
@@ -256,6 +312,7 @@ class LogParserEngine:
             self.state_dir,
             window_hours=get_int(self.config, "WINDOW_HOURS", 24),
             max_ips=get_int(self.config, "WINDOW_MAX_IPS", 200000),
+            v6_prefix=get_int(self.config, "IPV6_BLOCK_PREFIX", 64),
         )
 
         self.max_bytes_per_run = get_int(self.config, "LOG_MAX_MB_PER_RUN", 200) * 1024 * 1024

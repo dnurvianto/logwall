@@ -105,7 +105,16 @@ class AuditEngine:
         # Every guard runs here, once, for every candidate.
         allowed = {}
         for ip, meta in candidates.items():
-            refusal = self.guard.refusal_reason(ip)
+            # IPv6 counters are keyed by /64 (IPV6_BLOCK_PREFIX), so those
+            # candidates are ranges and must be judged by the range guard —
+            # which checks OVERLAP, not membership. A /64 holding one whitelisted
+            # address is refused whole, exactly as a /24 would be.
+            if "/" in ip:
+                refusal = self.guard.refusal_reason_network(
+                    ip, get_int(self.config, "SUBNET_MAX_WIDTH_V4", 24),
+                    get_int(self.config, "SUBNET_MAX_WIDTH_V6", 64))
+            else:
+                refusal = self.guard.refusal_reason(ip)
             if refusal:
                 self.refused[ip] = refusal
                 continue
@@ -124,8 +133,12 @@ class AuditEngine:
                 except ValueError:
                     continue
             for ip in list(allowed):
-                address = ipaddress.ip_address(ip)
-                if any(address.version == n.version and address in n for n in nets):
+                try:
+                    member = ipaddress.ip_network(ip, strict=False)
+                except ValueError:
+                    continue
+                if any(member.version == n.version and member.subnet_of(n)
+                       for n in nets):
                     del allowed[ip]
 
             allowed.update(networks)
