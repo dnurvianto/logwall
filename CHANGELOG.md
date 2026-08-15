@@ -2,6 +2,56 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc9 — 2026-08-15 (two defects found by migrating four production hosts)
+
+Both were found by running the tool, not by reading it, and one of them cost a
+production host its enforcement for fifteen minutes.
+
+### `uninstall.sh` never took the lock
+
+§16.1 requires every writer to hold `flock`. `uninstall.sh` did not — being a separate
+script rather than a `logwall` subcommand, it slipped past a rule written in terms of the
+CLI's shape rather than in terms of who writes. It is the most destructive writer here.
+
+Measured during a migration on a busy host, where a cron `apply` began in the same second:
+
+```
+20:42:02  cron apply begins       snapshot 20260815_204203
+20:42:03  uninstall begins        detaches hooks, deletes chains, destroys sets
+20:42:03  uninstall verifies      reports clean — correctly, at that instant
+20:42:04  the in-flight apply     rebuilds the chains and the sets
+```
+
+The host was left with orphaned chains still referencing their sets. The next preflight
+refused to install, reporting them as `FOREIGN_IPSET` belonging to another tool, and the
+host sat unenforced until they were cleared by hand.
+
+The verification was not broken — it was **outrun**, which is the point: checking at the
+end is no substitute for holding the lock throughout. Three other hosts came through the
+same migration clean, and that was luck, not safety: they were quieter, so their applies
+did not overlap.
+
+The lock is now taken before anything is touched, cron removal included. Verified on a
+host in both directions — lock held: exit 4 with chains, sets and cron unchanged; lock
+free: a complete uninstall leaving zero chains.
+
+### The ipset persistence warning overstated its consequence
+
+The ruleset persistence block already skips firewalld, ufw and CSF because those managers
+own their own persistence. The ipset block below it guarded only against CSF, so on a
+firewalld host it still announced that at boot `iptables-restore` would fail and the host
+would come up "with no firewall rules at all".
+
+Measured there: `/etc/sysconfig/iptables` did not exist and `iptables.service` was not
+installed. With no saved ruleset there is no `--match-set` reference that could fail. What
+actually happens is that firewalld brings the baseline up and the 2-minute apply cron
+rebuilds the sets.
+
+Right about the fact, wrong about the outcome — the same mistake `NO_BASELINE_POLICY` made
+with "protects almost nothing", and corrected for the same reason: an operator who checks
+one loud claim and finds it false stops believing the quiet ones. The loud wording now
+applies only where logwall itself saved a ruleset referencing the sets.
+
 ## 1.0.0-rc8 — 2026-08-15 (English throughout; audit findings)
 
 ### Everything is now in English
