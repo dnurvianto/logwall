@@ -293,11 +293,35 @@ fw_save_rules() {
 
         # Same rule as for the ruleset: never report something saved without
         # checking that anything reads it.
+        #
+        # But the CONSEQUENCE is not the same on every host, and the block above
+        # already knows it: when a manager owns the baseline, logwall saves no
+        # ruleset at all. With no saved ruleset there is no `--match-set`
+        # reference, so nothing can fail to restore against a missing set — the
+        # manager brings the baseline up and the apply cron rebuilds the sets.
+        #
+        # Measured on a firewalld host: /etc/sysconfig/iptables did not exist and
+        # iptables.service was not installed, while this warning still announced
+        # that the host would boot "with no firewall rules at all". Right about
+        # the fact, wrong about the outcome — the same mistake NO_BASELINE_POLICY
+        # made with "protects almost nothing". An operator who checks one loud
+        # claim and finds it false stops believing the quiet ones too.
         if ! fw_ipset_restore_available "$os_family"; then
-            echo "[WARN] ipset state saved to ${ipset_target}, but nothing on this host restores it at boot." >&2
-            echo "[WARN] The saved rules reference these sets, so at boot iptables-restore would FAIL" >&2
-            echo "[WARN] and the host would come up with no firewall rules at all." >&2
-            echo "[WARN] Fix: $(fw_ipset_package "$os_family")${ipset_reader:+   # read by ${ipset_reader}}" >&2
+            case "$backend" in
+                firewalld|ufw)
+                    echo "[INFO] ipset state saved to ${ipset_target}, but nothing on this host restores it at boot." >&2
+                    echo "[INFO] ${backend} restores the baseline itself, and logwall saved no ruleset that" >&2
+                    echo "[INFO] references these sets, so a reboot costs coverage until the apply cron" >&2
+                    echo "[INFO] rebuilds them — not the firewall." >&2
+                    echo "[INFO] To close that window: $(fw_ipset_package "$os_family")${ipset_reader:+   # read by ${ipset_reader}}" >&2
+                    ;;
+                *)
+                    echo "[WARN] ipset state saved to ${ipset_target}, but nothing on this host restores it at boot." >&2
+                    echo "[WARN] The saved rules reference these sets, so at boot iptables-restore would FAIL" >&2
+                    echo "[WARN] and the host would come up with no firewall rules at all." >&2
+                    echo "[WARN] Fix: $(fw_ipset_package "$os_family")${ipset_reader:+   # read by ${ipset_reader}}" >&2
+                    ;;
+            esac
         fi
     fi
 }
