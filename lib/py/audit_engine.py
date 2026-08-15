@@ -291,7 +291,85 @@ class AuditEngine:
 
             proposed[cidr] = {"reason": reason, "tier": tier}
 
+        proposed.update(self._evaluate_wide_v6(proposed))
         return proposed
+
+    def _evaluate_wide_v6(self, already_proposed):
+        """
+        Second-tier IPv6 rollup, for a source that uses one address per /64.
+
+        /64 is IPv6's single-allocation unit: it is the analogue of ONE IPv4
+        address, not of a /24. So when a crawler takes one address out of each of
+        its /64s, the /64 rollup aggregates nothing — every network holds exactly
+        one member, far below SUBNET_MIN_IPS, and the source arrives as dozens of
+        separate candidates.
+
+        Measured on a production host: 82 distinct addresses of the form
+        2a03:2880:f800:XX::, ~3,000 hits each. At /64 that was 70 candidates and
+        the circuit breaker aborted the run, blocking nothing. At /56 it is one.
+
+        /56 rather than /48: /56 covered 100% of that case, and /48 would be 256x
+        wider for no additional reach. The rule is to go no wider than the
+        evidence requires — a /56 is 256 /64s, the same factor a /24 aggregates
+        for IPv4, which keeps the two families symmetrical.
+        """
+        if not get_bool(self.config, "SUBNET6_WIDE_DETECTION", True):
+            return {}
+
+        prefix = get_int(self.config, "SUBNET6_WIDE_PREFIX", 56)
+        min_members = get_int(self.config, "SUBNET6_WIDE_MIN_PREFIXES", 8)
+        max_width = get_int(self.config, "SUBNET6_WIDE_MAX_WIDTH", 56)
+
+        threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS", 2000)
+        threshold_auth = get_int(self.config, "THRESHOLD_SUBNET_AUTH", 20)
+        threshold_intent = get_int(self.config, "THRESHOLD_SUBNET_INTENT", 20)
+
+        wide = {}
+
+        for cidr, agg in self.parser.window.subnet_rollup(24, prefix).items():
+            if ":" not in cidr:
+                continue
+            members = agg.get("members", 0)
+            if members < min_members:
+                continue
+
+            intent = agg["wp"] + agg["xmlrpc"] + agg["scan"] + agg["p401"]
+            if agg["auth"] > threshold_auth:
+                reason = (f"Subnet6AuthBruteForce | {members} /64s | "
+                          f"failed logins: {agg['auth']}x")
+                tier = TIER_PERMANENT
+            elif intent > threshold_intent:
+                reason = (f"Subnet6CoordinatedAttack | {members} /64s | "
+                          f"brute force/recon: {intent}x")
+                tier = TIER_PERMANENT
+            elif agg["hits"] > threshold_hits:
+                reason = f"Subnet6Flood | {members} /64s | Hits: {agg['hits']}x"
+                tier = self._volume_tier(agg["hits"], threshold_hits)
+            else:
+                continue
+
+            refusal = self.guard.refusal_reason_network(cidr, 24, max_width)
+            if refusal:
+                self.refused[cidr] = refusal
+                continue
+
+            wide[cidr] = {"reason": reason, "tier": tier}
+
+        # A /64 already covered by an accepted /56 is noise: one entry, not
+        # eighty. Same rule the /24 rollup applies to its own members.
+        if wide:
+            nets = [ipaddress.ip_network(c) for c in wide]
+            for cidr in list(already_proposed):
+                if ":" not in cidr:
+                    continue
+                try:
+                    net = ipaddress.ip_network(cidr)
+                except ValueError:
+                    continue
+                if any(net.subnet_of(parent) for parent in nets):
+                    already_proposed.pop(cidr, None)
+
+        return wide
 
     def health_flags(self):
         flags = dict(self.parser.flags)

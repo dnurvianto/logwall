@@ -598,6 +598,68 @@ check("subnet: a lone heavy host is blocked as a HOST, not as its /24",
       "185.199.9.99" in verdict and "185.199.9.0/24" not in verdict,
       [k for k in verdict if k.startswith("185.199.9")])
 
+# ---- second-tier IPv6 rollup: one address per /64 ---------------------------
+# /64 is IPv6's single-allocation unit — the analogue of ONE IPv4 address. A
+# crawler taking one address out of each of its /64s aggregates to nothing at
+# /64: every network holds exactly one member, so the source arrives as dozens of
+# separate candidates and the circuit breaker aborts the run.
+#
+# Measured on a production host: 82 addresses shaped 2a03:2880:f800:XX::, ~3,000
+# hits each. 70 candidates at /64; the breaker tripped and nothing was blocked.
+v6_state = os.path.join(work, "v6_state")
+os.makedirs(v6_state, exist_ok=True)
+v6_cfg = dict(sub_cfg)
+v6_cfg["STATE_DIR"] = v6_state
+
+v6 = log_parser.LogParserEngine(v6_cfg)
+v6.discover_log_files = lambda *a, **k: []
+v6.discover_auth_logs = lambda *a, **k: []
+for block in range(20):
+    for _ in range(300):
+        v6.window.add("2a03:2880:f800:%x::" % block, "hits", 1, now_ts)
+
+r64 = v6.window.subnet_rollup(24, 64)
+r56 = v6.window.subnet_rollup(24, 56)
+check("v6 wide: at /64 each address is alone — nothing aggregates",
+      max(a["members"] for a in r64.values()) == 1,
+      max(a["members"] for a in r64.values()))
+check("v6 wide: at /56 they collapse into ONE network",
+      r56.get("2a03:2880:f800::/56", {}).get("members") == 20,
+      r56.get("2a03:2880:f800::/56", {}).get("members"))
+
+v6_engine = apply_engine.ApplyEngine(v6_cfg)
+v6_engine.audit.parser = v6
+v6_engine.audit.parser.cdn_check = v6_engine.guard.is_cdn_edge_ip
+v6_verdict = v6_engine.audit.evaluate_candidates()
+
+check("v6 wide: the /56 is proposed as a single range",
+      "2a03:2880:f800::/56" in v6_verdict,
+      [k for k in v6_verdict if ":" in k])
+check("v6 wide: the member /64s are NOT listed separately",
+      not [k for k in v6_verdict if k.startswith("2a03:2880:f800:") and k != "2a03:2880:f800::/56"],
+      [k for k in v6_verdict if ":" in k])
+check("v6 wide: dozens of candidates collapse below the breaker limit",
+      len(v6_verdict) < int(v6_cfg["MAX_NEW_BLOCKS_PER_RUN"]), len(v6_verdict))
+
+# Below the evidence threshold nothing wide is proposed: a handful of /64s is not
+# proof of one coordinated source, and a /56 holds 256 of them.
+few_state = os.path.join(work, "few_state")
+os.makedirs(few_state, exist_ok=True)
+few_cfg = dict(v6_cfg); few_cfg["STATE_DIR"] = few_state
+few = log_parser.LogParserEngine(few_cfg)
+few.discover_log_files = lambda *a, **k: []
+few.discover_auth_logs = lambda *a, **k: []
+for block in range(3):
+    for _ in range(3000):
+        few.window.add("2a03:2880:f900:%x::" % block, "hits", 1, now_ts)
+few_engine = apply_engine.ApplyEngine(few_cfg)
+few_engine.audit.parser = few
+few_engine.audit.parser.cdn_check = few_engine.guard.is_cdn_edge_ip
+few_verdict = few_engine.audit.evaluate_candidates()
+check("v6 wide: 3 /64s is below the threshold — no /56 proposed",
+      "2a03:2880:f900::/56" not in few_verdict,
+      [k for k in few_verdict if ":" in k])
+
 # ---- guards on ranges: stricter than on single addresses --------------------
 gnet = ip_guard.IPGuard(cfg)
 check("subnet guard: a whitelisted host inside the range blocks the WHOLE range",
