@@ -62,7 +62,7 @@
 16. [Execution Reliability (locking, log cursors, circuit breaker)](#16-execution-reliability-locking-log-cursors-circuit-breaker)
 17. [Hardening the Tool Itself](#17-hardening-the-tool-itself)
 18. [Machine Output & Integration](#18-machine-output--integration)
-19. [Multi-Server (Fleet) Operations & Uninstall](#19-multi-server-fleet-operations--uninstall)
+19. [Uninstall](#19-uninstall)
 20. [Support Matrix (Distro × Web Server × Panel)](#20-support-matrix-distro--web-server--panel)
 21. [Pre-Installation Gate & Transactional Install](#21-pre-installation-gate--transactional-install)
 
@@ -282,9 +282,7 @@ logwall firewall confirm                  # confirm the apply worked → cancel 
 logwall firewall panic                    # EMERGENCY: detach jumps + flush LOGWALL_* chains (other tools' rules untouched)
 logwall selftest [--repair]               # verify chains/jumps/sets/permissions; --repair reinstalls what is missing
 
-# --- Fleet & lifecycle (§19) ---
-logwall firewall export-blacklist [--since 30d] [--min-hits N]
-logwall firewall import-blacklist <file> --source <host>
+# --- Lifecycle ---
 logwall version                           # tool version + distro + backend + panel + IPv6 status
 logwall uninstall [--purge]               # remove cron and rules; --purge also deletes data and config
 ```
@@ -1040,25 +1038,21 @@ running many.
   **support tier (§20)** + DEGRADED status. This is the first thing anyone needs when diagnosing
   a problem across servers.
 
-## 19. Multi-Server (Fleet) Operations & Uninstall
+## 19. Uninstall
 
-**Sharing intelligence between your own servers.** An attacker hammering `srv1` is almost always
-hammering `srv3` within hours. Owning several servers is only an advantage if the findings are
-shared.
-
-```
-logwall firewall export-blacklist --since 30d --min-hits 3 > /tmp/srv1-bl.txt
-# portable format: ip|first_seen|last_seen|reason|hits|state
-logwall firewall import-blacklist /tmp/srv1-bl.txt --source srv1
-```
-
-- Imports **must pass the same filters** as local candidates: the whitelist, the skip list, the
-  CDN hard guard, FCrDNS-verified bots. A file from another server is never trusted raw — one
-  misconfigured server could poison the whole fleet.
-- Filter with `FLEET_IMPORT_MIN_HITS` and `FLEET_IMPORT_MAX_AGE_DAYS`; imported entries carry a
-  `| via srv1` metadata tag so their origin stays traceable during review.
-- `TEMP` entries are not exported (too weak to pass on) — only `PERMANENT` ones.
-- Distribution through `rsync`/`scp` or a cron pull. Still **no external service**.
+> **Fleet sync is roadmap, not a feature.** Sharing blocklists between your own servers is
+> listed in the README roadmap and is deliberately outside 1.0. It is described here only so
+> the intent is on record; **nothing implements it**, and this section previously documented
+> two CLI commands that did not exist.
+>
+> That gap was not harmless. Half-finished scope shipped as `lib/py/fleet_sync.py` — never
+> called by the CLI, yet present and tested — and it was reached for during a migration and
+> misused. Documenting a command that does not exist invites exactly that.
+>
+> **Migrating another tool's blocklist is not in scope at all** and never will be (1.4.0
+> removed `import-legacy` for that reason). Every host has its own history, dependencies and
+> risk tolerance. preflight reports what it found and names the command to secure the data;
+> the admin decides and acts. That is sysadmin work, not something this tool performs.
 
 **A clean uninstall (`logwall uninstall`).** Without a clean way out, this tool is not fit to try
 on someone else's production server.

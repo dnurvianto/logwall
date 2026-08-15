@@ -691,46 +691,17 @@ written = eng_csf.emit_csf_list({}, csf_path)
 check("csf: nothing pending means an empty push list",
       written == 0 and open(csf_path, encoding="utf-8").read() == "")
 
-# ------------------------------------------------- fleet import accepts ranges
-# The blocklist is a hash:net set, so a range is as valid an entry as a single
-# address. refusal_reason() parses single addresses only, so every CIDR came back
-# INVALID_IP and was dropped — and the summary still read as a clean import.
-# A retired blocker's range blocks disappeared on migration without a word.
-import fleet_sync
+# ------------------------------------------- range width guard, on its own
+# A retired blocker may have blocked a /16. Carrying that over unexamined would
+# take out 65k addresses on the strength of a decision nobody here reviewed —
+# so the guard refuses anything wider than /24 and names its reason.
+check("guard: a range wider than /24 is refused",
+      guard.refusal_reason_network("57.141.0.0/16") == ip_guard.REFUSE_TOO_WIDE,
+      guard.refusal_reason_network("57.141.0.0/16"))
+check("guard: a /24 is accepted",
+      guard.refusal_reason_network("74.7.242.0/24") is None,
+      guard.refusal_reason_network("74.7.242.0/24"))
 
-fleet_bl = os.path.join(work, "fleet_blacklist.txt")
-fleet_cfg = dict(cfg)
-fleet_cfg["BLACKLIST"] = fleet_bl
-open(fleet_bl, "w", encoding="utf-8").close()
-
-fleet_in = os.path.join(work, "fleet_import.tsv")
-with open(fleet_in, "w", encoding="utf-8") as fh:
-    fh.write("185.199.108.90\tSingle address\n")
-    fh.write("74.7.242.0/24\tGPTBot range\n")
-    fh.write("57.141.0.0/16\tCrawler range\n")
-    fh.write("10.0.0.0/8\tPrivate range must be refused\n")
-    fh.write("185.199.108.90\tDuplicate\n")
-
-fleet = fleet_sync.FleetSyncEngine(fleet_cfg)
-imported = fleet.import_blacklist(fleet_in, "legacy_tool")
-fleet_body = open(fleet_bl, encoding="utf-8").read()
-
-check("fleet: CIDR entries survive the import", "74.7.242.0/24" in fleet_body,
-      fleet_body)
-check("fleet: single addresses still import", "185.199.108.90" in fleet_body)
-check("fleet: a private range is still refused", "10.0.0.0/8" not in fleet_body)
-check("fleet: duplicates are not written twice",
-      fleet_body.count("185.199.108.90") == 1, fleet_body.count("185.199.108.90"))
-check("fleet: imported count matches what landed in the file", imported == 2, imported)
-
-# Imports go through the same width guard as detections. A retired tool may have
-# blocked a /16; carrying that over unexamined would take out 65k addresses on
-# the strength of a decision nobody here reviewed.
-check("fleet: a range wider than /24 is refused, not imported",
-      "57.141.0.0/16" not in fleet_body)
-check("fleet: the width guard names its reason",
-      fleet.guard.refusal_reason_network("57.141.0.0/16") == ip_guard.REFUSE_TOO_WIDE,
-      fleet.guard.refusal_reason_network("57.141.0.0/16"))
 
 # ------------------------- v6 sets are only emitted when the host has IPv6 -----
 # A `swap` against a set the Bash layer never created aborts the entire restore,

@@ -499,8 +499,22 @@ class LogParserEngine:
         bytes_read = 0
         new_offset = offset
 
+        # Binary, not text, and the cursor is arithmetic rather than tell().
+        #
+        # In text mode Python only accepts a seek() offset of 0 or one that tell()
+        # previously returned; an arbitrary byte position leaves the TextIOWrapper
+        # in a state where the next tell() raises
+        # "OSError: telling position disabled by next() call". The budget line
+        # above computes exactly such an arbitrary offset, so the one path meant to
+        # protect a host from an enormous backlog was the path that crashed on it.
+        # Reproduced on Python 3.8, 3.11 and 3.12 — this was never version-specific.
+        #
+        # Binary mode fixes a second, quieter fault at the same time: len() on a
+        # text line counts CHARACTERS, so every non-ASCII byte made bytes_read
+        # drift below the real position, and that number is both the byte budget
+        # and the saved cursor.
         try:
-            handle = open(filepath, "r", encoding="utf-8", errors="ignore")
+            handle = open(filepath, "rb")
         except OSError:
             return
 
@@ -508,12 +522,12 @@ class LogParserEngine:
             handle.seek(offset)
             for raw_line in handle:
                 bytes_read += len(raw_line)
-                line = raw_line.strip()
+                line = raw_line.decode("utf-8", "ignore").strip()
                 if line:
                     yield line, bytes_read
                 if bytes_read >= budget:
                     break
-            new_offset = handle.tell()
+            new_offset = offset + bytes_read
         finally:
             handle.close()
 
