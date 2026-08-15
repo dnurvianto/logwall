@@ -65,12 +65,35 @@ detect_foreign_blockers() {
     owned=" $(logwall_owned_sets) "
 
     if command -v iptables >/dev/null 2>&1; then
+        local seen=" "
         while IFS= read -r line; do
             set_name=$(printf '%s\n' "$line" | sed -n 's/.*--match-set \([^ ]*\) .*/\1/p')
             [ -n "$set_name" ] || continue
             case "$owned" in
                 *" ${set_name} "*) continue ;;
             esac
+
+            # In coordination mode CSF's own sets are not a foreign agent to warn
+            # about — they are the partner logwall was told to defer to, and
+            # chain_DENY is precisely where its own blocks land. preflight.sh:282
+            # already excludes them; this path did not, so `selftest`, `apply` and
+            # `status` kept reporting the chosen configuration as something
+            # unexpected. Calling a deliberate arrangement "foreign" is how a
+            # report teaches an operator to skim past it.
+            if [ "${BACKEND:-auto}" = "csf" ]; then
+                case "$set_name" in
+                    chain_DENY|chain_ALLOW|chain_6_DENY|chain_6_ALLOW) continue ;;
+                esac
+            fi
+
+            # Deduplicated by set NAME, not by rule text: several rules commonly
+            # reference one set, and `sort -u` on whole lines let the same set be
+            # announced once per rule.
+            case "$seen" in
+                *" ${set_name} "*) continue ;;
+            esac
+            seen="${seen}${set_name} "
+
             echo "[FOREIGN] iptables rule uses set '${set_name}' (not managed by logwall)"
             found=1
         done < <(iptables -S 2>/dev/null | grep -- "--match-set" | grep -E "\-j (DROP|REJECT|ACCEPT)" | sort -u)
