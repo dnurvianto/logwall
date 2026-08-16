@@ -2,7 +2,7 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
-## 1.1.0-rc1 — 2026-08-16 (the blocking cap is gone; six detections added)
+## 1.0.0-rc11 — 2026-08-16 (the blocking cap is gone; six detections added)
 
 An audit of the verdict path, prompted by a question that turned out to have no
 good answer: what scenario is `MAX_NEW_BLOCKS_PER_RUN` for?

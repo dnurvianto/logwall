@@ -975,7 +975,7 @@ below close that gap.
    is not a safety measure.
 
    A circuit breaker used to sit here: candidates > `MAX_NEW_BLOCKS_PER_RUN` aborted the whole
-   run. It was removed in 1.1.0. It fired twice in production and was wrong both times — 500
+   run. It was removed in 1.0.0-rc11. It fired twice in production and was wrong both times — 500
    genuine addresses in one incident, 70 `/64`s of one crawler in the other — blocking nothing
    while the abuse continued. It committed state as it aborted, so the same candidates returned
    two minutes later and tripped it again; and it announced itself only on stderr, which cron
