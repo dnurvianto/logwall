@@ -2,6 +2,41 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## Unreleased
+
+### Stop advising a package the host cannot install
+
+On a Debian-family host managed by ufw, logwall printed
+`apt-get install -y ipset-persistent` as the way to close the reboot gap. That
+package pulls in `netfilter-persistent`, and ufw declares `Breaks` against it:
+
+```
+$ apt-get install --simulate ipset-persistent
+ufw : Breaks: netfilter-persistent but 1.0.20 is to be installed
+E: pkgProblemResolver::Resolve generated breaks
+```
+
+apt refuses outright, and its own suggested way out is to remove ufw. logwall
+prints `backend=ufw` one line above the advice, so it already knew — the package
+was chosen from the distro family alone. Advice that contradicts the tool's own
+detection is worse than no advice.
+
+The message now states the gap plainly and, for ufw hosts, names the systemd
+route instead of a package.
+
+The gap itself was measured rather than assumed. On Ubuntu 24.04 + ufw, with the
+chains detached and all four sets destroyed to reproduce what a reboot loses:
+
+```
+10:42:14  chains and sets gone
+10:44:05  restored by the */2 apply cron   =  111 seconds
+          members md5 before a3a05bde...  after a3a05bde...  identical
+          3/3 jumps, DROP active, ufw's own 17 rules untouched throughout
+```
+
+Worst case is bounded by the cron interval, just under two minutes. The blocklist
+file itself is never at risk — the kernel set is only a copy of it.
+
 ## 1.0.0-rc11 — 2026-08-16 (the blocking cap is gone; six detections added)
 
 An audit of the verdict path, prompted by a question that turned out to have no

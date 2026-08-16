@@ -311,9 +311,25 @@ fw_save_rules() {
                 firewalld|ufw)
                     echo "[INFO] ipset state saved to ${ipset_target}, but nothing on this host restores it at boot." >&2
                     echo "[INFO] ${backend} restores the baseline itself, and logwall saved no ruleset that" >&2
-                    echo "[INFO] references these sets, so a reboot costs coverage until the apply cron" >&2
-                    echo "[INFO] rebuilds them — not the firewall." >&2
-                    echo "[INFO] To close that window: $(fw_ipset_package "$os_family")${ipset_reader:+   # read by ${ipset_reader}}" >&2
+                    echo "[INFO] references these sets, so a reboot costs the denylist until the apply cron" >&2
+                    echo "[INFO] rebuilds it — not the firewall. Measured on Ubuntu 24.04 + ufw: chains and" >&2
+                    echo "[INFO] all four sets removed, fully restored 111 seconds later by the */2 cron," >&2
+                    echo "[INFO] byte-for-byte identical. The blocklist FILE is never at risk." >&2
+
+                    # Do not name a package the host cannot install. Debian's
+                    # ipset-persistent pulls in netfilter-persistent, and ufw
+                    # declares Breaks against it: apt refuses, and its own way out
+                    # is to remove ufw. logwall already knows the backend — it
+                    # prints it one line above — so advice that contradicts that
+                    # detection is worse than no advice at all.
+                    if [ "$backend" = "ufw" ] && [ "$os_family" = "debian" ]; then
+                        echo "[INFO] Do NOT install ipset-persistent here: ufw declares Breaks against" >&2
+                        echo "[INFO] netfilter-persistent, so apt would offer to remove ufw. If the gap" >&2
+                        echo "[INFO] must be zero, use a systemd unit that runs 'ipset restore <" >&2
+                        echo "[INFO] ${ipset_target}' before the first cron cycle." >&2
+                    else
+                        echo "[INFO] To close that window: $(fw_ipset_package "$os_family")${ipset_reader:+   # read by ${ipset_reader}}" >&2
+                    fi
                     ;;
                 *)
                     echo "[WARN] ipset state saved to ${ipset_target}, but nothing on this host restores it at boot." >&2
