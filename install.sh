@@ -616,7 +616,9 @@ cat <<EOF
  [BEFORE YOU ENABLE ENFORCE=1 — verify these yourself, logwall cannot]
    [ ] A second admin path exists (backup IP, VPN/tethering, or DDNS hostname)
    [ ] Your provider's console/VNC access works and you have tested logging in
-   [ ] THRESHOLD_HITS suits your traffic (default 40 is far too strict for a website)
+   [ ] THRESHOLD_HITS_PER_INTERVAL suits your traffic. The default 60, with
+       STRIKES_REQUIRED=2, is calibrated against a real site - but read a few
+       'logwall firewall audit' cycles before enabling enforcement anyway
 
  [NEXT]
    logwall doctor                    # re-check this host at any time
