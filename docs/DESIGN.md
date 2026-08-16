@@ -59,7 +59,7 @@
 13. [Central Configuration](#13-central-configuration)
 14. [Dual-Stack IPv6](#14-dual-stack-ipv6)
 15. [Anti-Lockout & Emergency Recovery](#15-anti-lockout--emergency-recovery)
-16. [Execution Reliability (locking, log cursors, circuit breaker)](#16-execution-reliability-locking-log-cursors-circuit-breaker)
+16. [Execution Reliability (locking, log cursors, catch-up guard)](#16-execution-reliability-locking-log-cursors-catch-up-guard)
 17. [Hardening the Tool Itself](#17-hardening-the-tool-itself)
 18. [Machine Output & Integration](#18-machine-output--integration)
 19. [Uninstall](#19-uninstall)
@@ -143,7 +143,7 @@ a panel.
 18. **Real IP behind a CDN** — parse `CF-Connecting-IP`/XFF plus a hard guard: CDN edge ranges
     may never enter the blacklist (blocking them takes the whole site down) (§8.F).
 19. **Collision and miscount avoidance** — file locking, per-inode log cursors, a state-backed
-    counting window, parser sanity checks, and a circuit breaker on blocks per cycle (§16).
+    counting window, parser sanity checks, and a catch-up guard on distorted input (§16).
 20. **Layered anti-lockout** — bootstrap the whitelist from the active SSH session, the deadman
     switch, `panic`, the `selftest --repair` monitor, and the STALE heartbeat (§15).
 21. **Hardening the tool itself** — root-only files at 0640/0750, refuse-to-run when writable by
@@ -339,9 +339,10 @@ NEW → PENDING_REVIEW → REVIEWED (through `logwall firewall ack <id>`)
    refused at any score)**, FCrDNS-verified bots, local/loopback/RFC1918 addresses, the server's
    own addresses, and the gateway and DNS resolvers the server uses; record the reason for every
    address (traceable).
-6. **Circuit breaker** — new candidates > `MAX_NEW_BLOCKS_PER_RUN` → **abort without blocking
-   anything**, write the candidates to the report plus an ALERT (§16.4). A sudden spike is
-   almost always a parsing fault, not a mass attack.
+6. **Catch-up guard** — if this run ingested far more log than one interval covers, the
+   **volume** rules are suspended for the run and the **intent** rules still apply; the report
+   carries `CATCHUP_RUN` with the reason (§16.4). No cap is placed on how many addresses a run
+   may block: every candidate came from a signal and already passed every guard in step 5.
 7. **Rebuild the sets** — `WHITELIST_SET`/`BLACKLIST_SET` (v4) plus
    `WHITELIST_SET6`/`BLACKLIST_SET6` (v6); metadata is attached as an ipset comment, or stays in
    the file when the backend is nft (§8.A2).
@@ -363,7 +364,7 @@ NEW → PENDING_REVIEW → REVIEWED (through `logwall firewall ack <id>`)
    back. The connectivity test only proves the session *currently running* is alive; the deadman
    catches the case where the admin is already cut off and cannot type anything.
 4. **The CDN hard guard** — CDN edge ranges can never enter the blacklist, for any reason.
-5. **The circuit breaker** — a cap on new blocks per cycle.
+5. **The catch-up guard** — volume rules stand down when the run's input is time-distorted.
 6. Idempotence — check for existence before adding a rule or entry.
 7. Thresholds come from the configuration file, never hardcoded.
 8. Blocks are permanent for intent-based detections; volume-based detections use the
@@ -792,7 +793,8 @@ WEBSERVER=auto                    # auto | nginx | apache | litespeed | caddy (�
 LOG_FORMAT=auto                   # auto | combined | json | custom (pair with LOG_REGEX)
 APACHE_BYTES_FIELD=auto           # auto | b | O — %O includes headers and must be normalised
 LOG_MAX_MB_PER_RUN=200            # read cap per cycle (protection against enormous logs)
-MAX_NEW_BLOCKS_PER_RUN=50         # circuit breaker: more than this → full abort + ALERT
+CATCHUP_GUARD=1                   # suspend volume rules when a run ingests a backlog
+CATCHUP_MAX_GAP_MIN=15            # a longer gap than this means the next run is a catch-up
 IPSET_MAXELEM=262144              # kernel default is 65536 → once full, ipset add fails SILENTLY
 IPSET_CAPACITY_ALERT_PCT=80
 SNAPSHOT_RETENTION=30             # prune old snapshots; never fill the disk
@@ -924,7 +926,7 @@ below close that gap.
    that dies quietly is more dangerous than one that was never installed, because the admin
    believes they are protected.
 
-## 16. Execution Reliability (locking, log cursors, circuit breaker)
+## 16. Execution Reliability (locking, log cursors, catch-up guard)
 
 1. **File locking.** The `*/2` cron, a manual `apply`, the weekly `review` and the monitor can
    all overlap. Two processes writing the ipset and `ip_blacklist.txt` at once → a corrupt file
@@ -967,13 +969,34 @@ below close that gap.
    WARN + the `PARSE_FAIL` status + **make no blocking decision at all from empty data**. The
    format can be forced through `LOG_FORMAT`/`LOG_REGEX`.
 
-4. **Circuit breaker.** New block candidates > `MAX_NEW_BLOCKS_PER_RUN` (default 50) →
-   **full abort, zero addresses blocked**, with every candidate written to the report under an
-   ALERT. The reasoning is empirical: a sudden surge to 500 candidates almost always means a log
-   format change, a real-IP misconfiguration, or one site's log leaking into another's — not 500
-   attackers who happened to arrive together. Without the breaker, one parser bug means the
-   server blocks all of its own visitors inside a single 2-minute cycle.
-   Proceed deliberately with `apply --force-breaker` once the candidates have been inspected.
+4. **Catch-up guard.** There is **no cap** on how many addresses one run may block. Every
+   entry reaching the apply stage came from a detection signal and had already passed every
+   guard, so a large batch means many offenders, and refusing to act on the tool's own findings
+   is not a safety measure.
+
+   A circuit breaker used to sit here: candidates > `MAX_NEW_BLOCKS_PER_RUN` aborted the whole
+   run. It was removed in 1.1.0. It fired twice in production and was wrong both times — 500
+   genuine addresses in one incident, 70 `/64`s of one crawler in the other — blocking nothing
+   while the abuse continued. It committed state as it aborted, so the same candidates returned
+   two minutes later and tripped it again; and it announced itself only on stderr, which cron
+   discards, so a host could decline to block anything for hours and still look healthy. It also
+   cancelled the **intent** verdicts along with the volume ones, releasing the most clearly
+   guilty addresses on the run.
+
+   What it was groping at is real, and is now measured at the source. Each line's own timestamp
+   is parsed (`parse_stamp()`, §8.G), so `_detect_catchup()` compares the **measured span** of the
+   data this run swallowed against `CATCHUP_MAX_GAP_MIN` — it does not guess from the gap between
+   runs. The difference is not academic: a host powered off for four hours wrote no log while it
+   was down, so the gap is four hours and the span is two minutes, and only the measurement gets
+   that right. When no timestamp anywhere in the batch can be read, the run gap is used as the
+   weaker fallback. On a catch-up run:
+
+   - **volume** detections stand down — request counts, bandwidth, 404 storms, login POSTs, and
+     the subnet flood/bandwidth rollups
+   - **intent** detections keep firing — brute force, recon, failed logins, scanner signatures.
+     Five probes for `/.env` are five probes whether they arrived over two minutes or two days
+   - the run is reported as `CATCHUP_RUN` on stdout, in the daily report, and in
+     `state/run_meta.json`
 
 5. **Set capacity** — see §8.A3 (a full set means `ipset add` fails silently).
 
@@ -1026,7 +1049,6 @@ running many.
   | 3 | No firewall backend detected |
   | 4 | The lock is held by another process |
   | 5 | DEGRADED mode (Python unavailable, §5) |
-  | 6 | Circuit breaker active — apply aborted |
   | 10 | An automatic rollback happened (connectivity test or deadman failed) |
 
 - **`--dry-run`** on `apply` — print the exact diff of rules and entries that would be added or

@@ -26,7 +26,6 @@ EXIT_CONFIG=2
 EXIT_NO_BACKEND=3
 EXIT_LOCKED=4
 EXIT_DEGRADED=5
-EXIT_BREAKER=6
 EXIT_ROLLED_BACK=10
 
 # Always resolve modules relative to this script, never to a stale copy.
@@ -74,7 +73,6 @@ QUIET=0
 DRY_RUN=0
 AS_JSON=0
 NO_CONFIRM=0
-FORCE_BREAKER=0
 REPAIR=0
 DEADMAN_RUN=0
 POSITIONAL=()
@@ -85,7 +83,6 @@ for arg in "$@"; do
         --dry-run)       DRY_RUN=1 ;;
         --json)          AS_JSON=1 ;;
         --no-confirm)    NO_CONFIRM=1 ;;
-        --force-breaker) FORCE_BREAKER=1 ;;
         --repair)        REPAIR=1 ;;
         --deadman)       DEADMAN_RUN=1 ;;
         *)               POSITIONAL+=("$arg") ;;
@@ -209,7 +206,6 @@ cmd_apply() {
     else
         py_args=(--emit-ipset "$ipset_script")
     fi
-    [ "$FORCE_BREAKER" -eq 1 ] && py_args+=(--force-breaker)
     [ "$DRY_RUN" -eq 1 ] && py_args+=(--dry-run)
 
     set +e
@@ -217,10 +213,6 @@ cmd_apply() {
     python_rc=$?
     set -e
 
-    if [ "$python_rc" -eq "$EXIT_BREAKER" ]; then
-        echo "[ABORT] Circuit breaker tripped — no firewall rule was changed." >&2
-        return "$EXIT_BREAKER"
-    fi
     if [ "$python_rc" -ne 0 ]; then
         echo "[ERROR] Apply engine failed (exit ${python_rc}) — no firewall rule was changed." >&2
         return "$EXIT_DEGRADED"
@@ -708,7 +700,7 @@ Usage: logwall <command> [options]
   selftest [--repair]            Verify (and optionally repair) hooks and sets
   version                        Print version and detected environment
 
-Options: --quiet  --dry-run  --json  --no-confirm  --force-breaker
+Options: --quiet  --dry-run  --json  --no-confirm
 EOF
 }
 

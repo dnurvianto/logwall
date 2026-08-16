@@ -44,6 +44,20 @@ class ReportGenerator:
             pass
         return rows
 
+    def _catchup(self):
+        """Reason string when the last completed run was a catch-up, else None."""
+        path = os.path.join(self.state_dir, "run_meta.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not data.get("catchup"):
+            return None
+        return str(data.get("catchup_reason") or "volume rules were suspended")
+
     def _selftest(self):
         """Last recorded selftest result: (timestamp, failures, labels).
 
@@ -101,6 +115,14 @@ class ReportGenerator:
 
         if not os.path.isfile(self.blacklist_file):
             flags.append("NO_BLACKLIST_FILE")
+
+        # A catch-up run suspends the volume rules, so the report has to say so.
+        # Its predecessor, the circuit breaker, announced itself only on stderr —
+        # which cron discards — and appeared in no report at all, so a host could
+        # decline to block anything for hours and still look healthy here.
+        catchup = self._catchup()
+        if catchup:
+            flags.append(f"CATCHUP_RUN ({catchup})")
 
         selftest = self._selftest()
         if selftest is None:

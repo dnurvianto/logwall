@@ -6,8 +6,10 @@ Exercises the detection pipeline against synthetic logs in a temp directory.
 Touches no firewall, no kernel set, and no system path — safe to run anywhere.
 Usage: python3 tests/smoke_test.py
 """
+import calendar
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -29,6 +31,22 @@ def write(name, text):
     return path
 
 
+def steady(state_dir):
+    """
+    Marks a state dir as belonging to a host that has already been running.
+
+    Without it the catch-up guard is right to treat the run as the first ever —
+    on a real first run the whole existing log is read from byte zero, so every
+    volume count covers days rather than one interval — and suspends the volume
+    rules. Tests that assert volume detection must therefore say which of the
+    two situations they are simulating.
+    """
+    os.makedirs(state_dir, exist_ok=True)
+    with open(os.path.join(state_dir, "run_meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"last_run": int(time.time()) - 60}, f)
+    return state_dir
+
+
 conf = write("logwall.conf", f"""
 WHITELIST={work}/whitelist.txt
 BLACKLIST={work}/blacklist.txt
@@ -41,7 +59,7 @@ THRESHOLD_XMLRPC=2
 THRESHOLD_SENSITIVE_SCAN=2
 THRESHOLD_BW_MB=1
 WINDOW_HOURS=24
-MAX_NEW_BLOCKS_PER_RUN=50
+CATCHUP_MAX_GAP_MIN=15
 TEMP_BLOCK_HOURS=48
 BLOCK_ESCALATION=1
 GOOGLE_BOT_NETS="66.249.64.0/19"
@@ -101,6 +119,15 @@ check("parse: IPv6 survives intact", str(ip_guard.parse_ip("2001:db8::5")) == "2
       str(ip_guard.parse_ip("2001:db8::5")))
 check("parse: IPv4 with port trimmed", str(ip_guard.parse_ip("185.199.108.153:443")) == "185.199.108.153")
 
+
+def stamp_now(offset=-60):
+    """Combined-format timestamp `offset` seconds from now, always UTC."""
+    t = time.gmtime(int(time.time()) + offset)
+    return "%02d/%s/%d:%02d:%02d:%02d +0000" % (
+        t.tm_mday, "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[t.tm_mon - 1],
+        t.tm_year, t.tm_hour, t.tm_min, t.tm_sec)
+
+
 # ------------------------------------------------- sliding window across runs
 log_path = write("access.log", "")
 attacker = "185.199.108.153"
@@ -109,7 +136,7 @@ attacker = "185.199.108.153"
 def append_hits(count, uri="/index.html", status=200, size=100):
     with open(log_path, "a", encoding="utf-8") as f:
         for _ in range(count):
-            f.write(f'{attacker} - - [12/Aug/2026:10:00:00 +0700] "GET {uri} HTTP/1.1" '
+            f.write(f'{attacker} - - [{stamp_now()}] "GET {uri} HTTP/1.1" '
                     f'{status} {size} "-" "curl/8"\n')
 
 
@@ -139,7 +166,7 @@ check("window: run 3 with no new bytes does not double count",
 cdn_log = write("cdn.log", "")
 with open(cdn_log, "a", encoding="utf-8") as f:
     for _ in range(30):
-        f.write('104.16.5.5 - - [12/Aug/2026:10:00:00 +0700] "GET / HTTP/1.1" 200 100 "-" "x"\n')
+        f.write(f'104.16.5.5 - - [{stamp_now()}] "GET / HTTP/1.1" 200 100 "-" "x"\n')
 p_cdn = log_parser.LogParserEngine(cfg)
 p_cdn.cdn_check = guard.is_cdn_edge_ip
 m_cdn = p_cdn.analyze_traffic([cdn_log])
@@ -151,7 +178,7 @@ check("cdn: log flagged CDN_NO_REALIP", bool(p_cdn.flags["CDN_NO_REALIP"]))
 xff_log = write("xff.log", "")
 with open(xff_log, "a", encoding="utf-8") as f:
     for _ in range(30):
-        f.write('104.16.5.5 - - [12/Aug/2026:10:00:00 +0700] "GET / HTTP/1.1" 200 100 '
+        f.write(f'104.16.5.5 - - [{stamp_now()}] "GET / HTTP/1.1" 200 100 '
                 '"-" "x" "203.0.113.44"\n')
 p_xff = log_parser.LogParserEngine(cfg)
 p_xff.cdn_check = guard.is_cdn_edge_ip
@@ -185,9 +212,15 @@ check("comment: shell metacharacters stripped for ipset",
 #
 # Log discovery must be silenced, or the engine walks the HOST's access logs.
 # On a workstation there are none and the test looks correct; on a live web
-# server it swept 557 real visitors into the run, tripped the circuit breaker,
-# and returned EXIT_BREAKER instead of 0 — a failure that looked like a Python
-# version problem and was nothing of the sort.
+# server it swept 557 real visitors into the run and returned a wrong result
+# that looked like a Python version problem and was nothing of the sort.
+#
+# run_meta.json is seeded so this reads as a STEADY-STATE run. Without it the
+# catch-up guard correctly treats the run as a first-ever one and suspends the
+# volume rules, which is the behaviour tested further down.
+with open(os.path.join(state, "run_meta.json"), "w", encoding="utf-8") as f:
+    json.dump({"last_run": int(time.time()) - 60}, f)
+
 engine = apply_engine.ApplyEngine(cfg)
 engine.audit.parser.discover_log_files = lambda *a, **k: []
 engine.audit.parser.discover_auth_logs = lambda *a, **k: []
@@ -209,17 +242,37 @@ check("ipset: whitelist CIDR pushed into the kernel set",
       "add LOGWALL_WL4_TMP 203.0.113.0/24" in content)
 check("ipset: attacker present in blacklist set", f"add LOGWALL_BL4_TMP {attacker}" in content)
 
-# ------------------------------------------------------------ circuit breaker
-engine2 = apply_engine.ApplyEngine(cfg)
+# --------------------------------------------------------------- no blocking cap
+#
+# There is no MAX_NEW_BLOCKS_PER_RUN any more. Every entry reaching the apply
+# stage came from a detection signal and already passed every guard, so a large
+# batch means many offenders — not a fault. The old cap fired twice in
+# production, both times on genuine abuse, and blocked nothing.
+# A private blacklist and state dir: 400 entries must not leak into the runs
+# that follow, or a later test finds its address already blocked and skipped.
+cap_state = os.path.join(work, "state_nocap")
+os.makedirs(cap_state, exist_ok=True)
+cap_cfg = dict(cfg)
+cap_cfg["BLACKLIST"] = os.path.join(work, "blacklist_nocap.txt")
+cap_cfg["STATE_DIR"] = steady(cap_state)
+
+flood = {f"45.{n // 256}.{n % 256}.7": {"reason": "test", "tier": "PERMANENT"}
+         for n in range(400)}
+engine2 = apply_engine.ApplyEngine(cap_cfg)
 engine2.audit.parser.discover_log_files = lambda *a, **k: []
 engine2.audit.parser.discover_auth_logs = lambda *a, **k: []
-engine2.max_new_blocks = 0
-engine2.audit.evaluate_candidates = lambda *a, **k: {
-    "185.199.108.200": {"reason": "test", "tier": "PERMANENT"}}
-code2, _ = engine2.execute()
-check("breaker: trips and returns exit code 6", code2 == 6, code2)
-after = open(os.path.join(work, "blacklist.txt"), encoding="utf-8").read()
-check("breaker: nothing was written to the blacklist", "185.199.108.200" not in after)
+engine2.audit.evaluate_candidates = lambda *a, **k: dict(flood)
+code2, entries2 = engine2.execute()
+check("no cap: 400 candidates all block, exit 0", code2 == 0, code2)
+check("no cap: every candidate reached the blacklist",
+      all(target in entries2 for target in flood),
+      sum(1 for t in flood if t in entries2))
+check("no cap: MAX_NEW_BLOCKS_PER_RUN is gone from the engine",
+      not hasattr(engine2, "max_new_blocks"))
+check("no cap: --force-breaker is gone from the CLI",
+      "force-breaker" not in open(
+          os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logwall"),
+          encoding="utf-8").read())
 
 # ------------------------------------------- web server log format fixtures
 # Parsing is pure file I/O, so every supported web server is covered offline —
@@ -227,15 +280,61 @@ check("breaker: nothing was written to the blacklist", "185.199.108.200" not in 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
+_FX_STAMP = re.compile(r"\[(\d{2})/(\w{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})\]")
+_FX_TS = re.compile(r'"ts":(\d+(?:\.\d+)?)')
+_FX_MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
+def fresh_fixture(name):
+    """
+    Copies a fixture into the work dir with every timestamp shifted so the last
+    line lands a minute ago, preserving the spacing between lines.
+
+    The fixtures carry fixed dates on purpose — they are meant to be read. But
+    the parser now stamps each counter with the REQUEST's own time and prune()
+    drops anything older than WINDOW_HOURS, so a fixture written last week
+    correctly produces nothing at all.
+    """
+    source = os.path.join(FIXTURES, name)
+    body = open(source, encoding="utf-8").read()
+
+    stamps = [calendar.timegm((int(m.group(3)), _FX_MONTHS.index(m.group(2)) + 1,
+                               int(m.group(1)), int(m.group(4)), int(m.group(5)),
+                               int(m.group(6)), 0, 0, 0))
+              for m in _FX_STAMP.finditer(body)]
+    stamps += [int(float(m.group(1))) for m in _FX_TS.finditer(body)]
+    if not stamps:
+        return source
+
+    delta = (int(time.time()) - 60) - max(stamps)
+
+    def shift_combined(m):
+        moment = calendar.timegm((int(m.group(3)), _FX_MONTHS.index(m.group(2)) + 1,
+                                  int(m.group(1)), int(m.group(4)), int(m.group(5)),
+                                  int(m.group(6)), 0, 0, 0)) + delta
+        t = time.gmtime(moment)
+        return "[%02d/%s/%d:%02d:%02d:%02d +0000]" % (
+            t.tm_mday, _FX_MONTHS[t.tm_mon - 1], t.tm_year,
+            t.tm_hour, t.tm_min, t.tm_sec)
+
+    body = _FX_STAMP.sub(shift_combined, body)
+    body = _FX_TS.sub(lambda m: '"ts":%.1f' % (float(m.group(1)) + delta), body)
+
+    target = os.path.join(work, "fx_" + name)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(body)
+    return target
+
+
 def parse_fixture(name, cdn_check=None):
     """Runs one fixture through a parser with a private state dir."""
     fx_state = os.path.join(work, "fx_state_" + name)
     os.makedirs(fx_state, exist_ok=True)
     fx_cfg = dict(cfg)
-    fx_cfg["STATE_DIR"] = fx_state
+    fx_cfg["STATE_DIR"] = steady(fx_state)
     parser_fx = log_parser.LogParserEngine(fx_cfg)
     parser_fx.cdn_check = cdn_check if cdn_check is not None else guard.is_cdn_edge_ip
-    metrics = parser_fx.analyze_traffic([os.path.join(FIXTURES, name)])
+    metrics = parser_fx.analyze_traffic([fresh_fixture(name)])
     return parser_fx, metrics
 
 
@@ -312,10 +411,10 @@ check("parser streams instead of materialising the file",
 auth_state = os.path.join(work, "auth_state")
 os.makedirs(auth_state, exist_ok=True)
 auth_cfg = dict(cfg)
-auth_cfg["STATE_DIR"] = auth_state
+auth_cfg["STATE_DIR"] = steady(auth_state)
 p_auth = log_parser.LogParserEngine(auth_cfg)
 p_auth.cdn_check = guard.is_cdn_edge_ip
-m_auth = p_auth.analyze_traffic([], [os.path.join(FIXTURES, "auth_secure.log")])
+m_auth = p_auth.analyze_traffic([], [fresh_fixture("auth_secure.log")])
 af = m_auth["auth_fail"]
 
 check("auth: sshd failed passwords counted", af.get("185.199.108.80") == 3, af)
@@ -407,11 +506,11 @@ check("profile: Chrome does not declare itself",
 prof_state = os.path.join(work, "prof_state")
 os.makedirs(prof_state, exist_ok=True)
 prof_cfg = dict(cfg)
-prof_cfg["STATE_DIR"] = prof_state
+prof_cfg["STATE_DIR"] = steady(prof_state)
 prof_cfg["ASSET_MIN_SAMPLES"] = "4"
 pp = log_parser.LogParserEngine(prof_cfg)
 pp.cdn_check = guard.is_cdn_edge_ip
-mp = pp.analyze_traffic([os.path.join(FIXTURES, "browser_vs_script.log")])
+mp = pp.analyze_traffic([fresh_fixture("browser_vs_script.log")])
 
 check("profile: browser client counted mostly assets",
       mp["assets"].get("203.0.113.201") == 4 and mp["pages"].get("203.0.113.201") == 1,
@@ -427,7 +526,7 @@ prof2 = dict(prof_cfg)
 prof2["THRESHOLD_HITS"] = "4"
 prof2["SUBNET_DETECTION"] = "0"
 prof2["BROWSER_TOLERANCE_FACTOR"] = "3"
-pe2 = log_parser.LogParserEngine(dict(prof2, STATE_DIR=os.path.join(work, "prof2")))
+pe2 = log_parser.LogParserEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof2"))))
 pe2.discover_log_files = lambda *a, **k: []
 pe2.discover_auth_logs = lambda *a, **k: []
 now_p = int(time.time())
@@ -441,7 +540,7 @@ for _ in range(45):                      # script: 45 pages, no assets
     pe2.window.add("185.199.121.9", "hits", 1, now_p)
     pe2.window.add("185.199.121.9", "pages", 1, now_p)
 
-ae2 = apply_engine.ApplyEngine(dict(prof2, STATE_DIR=os.path.join(work, "prof2")))
+ae2 = apply_engine.ApplyEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof2"))))
 ae2.audit.parser = pe2
 pe2.cdn_check = ae2.guard.is_cdn_edge_ip
 v2 = ae2.audit.evaluate_candidates()
@@ -457,14 +556,14 @@ check("profile: the reason records the evidence",
 
 # A site that serves its assets from a CDN must not have every visitor profiled
 # as a script.
-pe3 = log_parser.LogParserEngine(dict(prof2, STATE_DIR=os.path.join(work, "prof3")))
+pe3 = log_parser.LogParserEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof3"))))
 pe3.discover_log_files = lambda *a, **k: []
 pe3.discover_auth_logs = lambda *a, **k: []
 for host in range(1, 6):                 # everyone fetches pages only
     for _ in range(45):
         pe3.window.add(f"203.0.113.{220+host}", "hits", 1, now_p)
         pe3.window.add(f"203.0.113.{220+host}", "pages", 1, now_p)
-ae3 = apply_engine.ApplyEngine(dict(prof2, STATE_DIR=os.path.join(work, "prof3")))
+ae3 = apply_engine.ApplyEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof3"))))
 ae3.audit.parser = pe3
 pe3.cdn_check = ae3.guard.is_cdn_edge_ip
 ae3.audit.evaluate_candidates()
@@ -477,7 +576,7 @@ check("profile: and says so in the health flags",
 esc_state = os.path.join(work, "esc_state")
 os.makedirs(esc_state, exist_ok=True)
 esc_cfg = dict(cfg)
-esc_cfg["STATE_DIR"] = esc_state
+esc_cfg["STATE_DIR"] = steady(esc_state)
 esc_cfg["BLACKLIST"] = os.path.join(work, "esc_blacklist.txt")
 esc_cfg["SUBNET_DETECTION"] = "0"
 esc_cfg["TEMP_BLOCK_HOURS"] = "48"
@@ -560,10 +659,9 @@ check("escalation: BLOCK_ESCALATION=0 blocks permanently on first sighting",
 sub_state = os.path.join(work, "sub_state")
 os.makedirs(sub_state, exist_ok=True)
 sub_cfg = dict(cfg)
-sub_cfg["STATE_DIR"] = sub_state
+sub_cfg["STATE_DIR"] = steady(sub_state)
 sub_cfg["SUBNET_MIN_IPS"] = "5"
 sub_cfg["THRESHOLD_SUBNET_HITS"] = "2000"
-sub_cfg["MAX_NEW_BLOCKS_PER_RUN"] = "50"
 
 flood = log_parser.LogParserEngine(sub_cfg)
 # Must be "now": the sliding window prunes anything older than WINDOW_HOURS, and
@@ -603,7 +701,7 @@ check("subnet: member addresses are NOT listed separately",
 check("subnet: 500 candidates collapse to a handful",
       len(verdict) <= 3, len(verdict))
 check("subnet: below the breaker limit, so blocking actually happens",
-      len(verdict) <= int(sub_cfg["MAX_NEW_BLOCKS_PER_RUN"]), len(verdict))
+      len(verdict) <= 50, len(verdict))
 check("subnet: a lone heavy host is blocked as a HOST, not as its /24",
       "185.199.9.99" in verdict and "185.199.9.0/24" not in verdict,
       [k for k in verdict if k.startswith("185.199.9")])
@@ -615,7 +713,7 @@ check("subnet: a lone heavy host is blocked as a HOST, not as its /24",
 # 200 against a threshold of 400 — 1,200 requests, nothing detected.
 rot_state = os.path.join(work, "rot_state")
 os.makedirs(rot_state, exist_ok=True)
-rot_cfg = dict(cfg); rot_cfg["STATE_DIR"] = rot_state
+rot_cfg = dict(cfg); rot_cfg["STATE_DIR"] = steady(rot_state)
 rot = log_parser.LogParserEngine(rot_cfg)
 for host in range(6):
     for _ in range(200):
@@ -630,7 +728,7 @@ check("v6 /64: the counter holds every request the visitor made",
 # The escape hatch has to work, or a host with unusual v6 allocation is stuck.
 per_state = os.path.join(work, "per_state")
 os.makedirs(per_state, exist_ok=True)
-per_cfg = dict(cfg); per_cfg["STATE_DIR"] = per_state; per_cfg["IPV6_BLOCK_PREFIX"] = "128"
+per_cfg = dict(cfg); per_cfg["STATE_DIR"] = steady(per_state); per_cfg["IPV6_BLOCK_PREFIX"] = "128"
 per = log_parser.LogParserEngine(per_cfg)
 for host in range(6):
     per.window.add("2001:db8:abcd:1234:%x::1" % host, "hits", 200, now_ts)
@@ -648,7 +746,7 @@ with open(os.path.join(mig_state, "window.json"), "w", encoding="utf-8") as fh:
         "2001:db8:aaaa:1::99": {"hits": 250, "first": now_ts, "last": now_ts},
         "185.199.108.10":      {"hits": 10,  "first": now_ts, "last": now_ts},
     }}, fh)
-mig_cfg = dict(cfg); mig_cfg["STATE_DIR"] = mig_state
+mig_cfg = dict(cfg); mig_cfg["STATE_DIR"] = steady(mig_state)
 mig = log_parser.LogParserEngine(mig_cfg)
 check("v6 /64: an old state file folds its bare keys into the /64 on load",
       mig.window.entries.get("2001:db8:aaaa:1::/64", {}).get("hits") == 550,
@@ -668,7 +766,7 @@ check("v6 /64: folding leaves IPv4 keys untouched",
 v6_state = os.path.join(work, "v6_state")
 os.makedirs(v6_state, exist_ok=True)
 v6_cfg = dict(sub_cfg)
-v6_cfg["STATE_DIR"] = v6_state
+v6_cfg["STATE_DIR"] = steady(v6_state)
 
 v6 = log_parser.LogParserEngine(v6_cfg)
 v6.discover_log_files = lambda *a, **k: []
@@ -698,13 +796,13 @@ check("v6 wide: the member /64s are NOT listed separately",
       not [k for k in v6_verdict if k.startswith("2a03:2880:f800:") and k != "2a03:2880:f800::/56"],
       [k for k in v6_verdict if ":" in k])
 check("v6 wide: dozens of candidates collapse below the breaker limit",
-      len(v6_verdict) < int(v6_cfg["MAX_NEW_BLOCKS_PER_RUN"]), len(v6_verdict))
+      len(v6_verdict) < 50, len(v6_verdict))
 
 # Below the evidence threshold nothing wide is proposed: a handful of /64s is not
 # proof of one coordinated source, and a /56 holds 256 of them.
 few_state = os.path.join(work, "few_state")
 os.makedirs(few_state, exist_ok=True)
-few_cfg = dict(v6_cfg); few_cfg["STATE_DIR"] = few_state
+few_cfg = dict(v6_cfg); few_cfg["STATE_DIR"] = steady(few_state)
 few = log_parser.LogParserEngine(few_cfg)
 few.discover_log_files = lambda *a, **k: []
 few.discover_auth_logs = lambda *a, **k: []
@@ -739,7 +837,7 @@ check("subnet guard: RFC1918 range refused",
 few_state = os.path.join(work, "few_state")
 os.makedirs(few_state, exist_ok=True)
 few_cfg = dict(sub_cfg)
-few_cfg["STATE_DIR"] = few_state
+few_cfg["STATE_DIR"] = steady(few_state)
 few = log_parser.LogParserEngine(few_cfg)
 few.discover_log_files = lambda *a, **k: []
 few.discover_auth_logs = lambda *a, **k: []
@@ -874,6 +972,225 @@ check("naming: configured set name is honoured end to end",
       "swap LOGWALL_CUSTOM4_TMP LOGWALL_CUSTOM4" in body)
 check("naming: generic set name never appears in the emitted script",
       "BLACKLIST_SET" not in body and "WHITELIST_SET" not in body)
+
+# ================================================================ new signals
+#
+# Six detections added after the 16 Aug audit of the verdict path. Each one is
+# exercised on counters built directly, so no fixture or web server is involved.
+
+def verdict_for(name, counters, overrides=None):
+    """Runs one address' counters through the real audit path."""
+    sig_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
+                   CLIENT_PROFILING="0")
+    sig_cfg.update(overrides or {})
+    sig_cfg["STATE_DIR"] = steady(os.path.join(work, "sig_" + name))
+    pe = log_parser.LogParserEngine(sig_cfg)
+    pe.discover_log_files = lambda *a, **k: []
+    pe.discover_auth_logs = lambda *a, **k: []
+    stamp = int(time.time())
+    for ip, metrics in counters.items():
+        for metric, value in metrics.items():
+            pe.window.add(ip, metric, value, stamp)
+    ae = apply_engine.ApplyEngine(sig_cfg)
+    ae.audit.parser = pe
+    pe.cdn_check = ae.guard.is_cdn_edge_ip
+    return ae.audit.evaluate_candidates()
+
+
+# --- N1 IntentComposite ------------------------------------------------------
+# Every component stays at or below its own threshold, which is exactly the
+# shape that used to escape: the /24 rollup has summed these four since 1.0, so
+# a lone attacker was judged more leniently than its own neighbours.
+v = verdict_for("intent", {"45.10.10.10": {
+    "hits": 12, "wp": 3, "xmlrpc": 2, "scan": 2, "p401": 5}})
+check("intent: composite is a candidate", "45.10.10.10" in v, sorted(v))
+check("intent: named IntentComposite, not the volume rule",
+      "IntentComposite" in v.get("45.10.10.10", {}).get("reason", ""),
+      v.get("45.10.10.10"))
+check("intent: permanent on first sighting",
+      v.get("45.10.10.10", {}).get("tier") == "PERMANENT")
+v = verdict_for("intent_low", {"45.10.10.11": {
+    "hits": 5, "wp": 2, "xmlrpc": 1, "scan": 1}})
+check("intent: below the sum, nothing is proposed", "45.10.10.11" not in v, sorted(v))
+
+# --- N3 ToolSignature --------------------------------------------------------
+check("attack ua: sqlmap is an attack signature",
+      log_parser.classify_attack_ua("sqlmap/1.7.2#stable"))
+check("attack ua: curl is NOT - it is an honest API client",
+      not log_parser.classify_attack_ua("curl/8.5.0"))
+check("attack ua: python-requests is NOT",
+      not log_parser.classify_attack_ua("python-requests/2.31.0"))
+check("attack ua: an absent agent is NOT an attack signature",
+      not log_parser.classify_attack_ua("-") and not log_parser.classify_attack_ua(""))
+check("attack ua: generic clients still count toward profiling",
+      log_parser.classify_user_agent("curl/8.5.0"))
+v = verdict_for("aua", {"45.10.20.10": {"hits": 3, "aua": 1}})
+check("attack ua: one request is enough",
+      "ToolSignature" in v.get("45.10.20.10", {}).get("reason", ""), sorted(v))
+check("attack ua: permanent",
+      v.get("45.10.20.10", {}).get("tier") == "PERMANENT")
+
+# --- N2 PathBruteForce -------------------------------------------------------
+v = verdict_for("scan404", {"45.10.30.10": {"hits": 60, "p404": 50}})
+check("404: a scanner whose requests are mostly 404 is caught",
+      "PathBruteForce" in v.get("45.10.30.10", {}).get("reason", ""), sorted(v))
+# The ratio guard is what stops a site with a broken theme from convicting its
+# own visitors: same 50 not-founds, but a small share of real traffic.
+v = verdict_for("scan404_ratio", {"45.10.30.11": {"hits": 500, "p404": 50}})
+check("404: same count but a low share is NOT a path brute force",
+      "PathBruteForce" not in v.get("45.10.30.11", {}).get("reason", ""),
+      v.get("45.10.30.11"))
+
+# --- N4 GenericLoginBrute ----------------------------------------------------
+v = verdict_for("login", {"45.10.40.10": {"hits": 20, "lpost": 15}})
+check("login: repeated POSTs to a non-WordPress login are caught",
+      "GenericLoginBrute" in v.get("45.10.40.10", {}).get("reason", ""), sorted(v))
+check("login: without rejections it is only temporary",
+      v.get("45.10.40.10", {}).get("tier") == "TEMP",
+      v.get("45.10.40.10", {}).get("tier"))
+v = verdict_for("login_rej", {"45.10.40.11": {"hits": 20, "lpost": 15, "p401": 4}})
+check("login: POSTs plus rejections escalate to permanent",
+      v.get("45.10.40.11", {}).get("tier") == "PERMANENT",
+      v.get("45.10.40.11"))
+
+# --- N5 sensitive-file list --------------------------------------------------
+sensitive_pe = log_parser.LogParserEngine(dict(cfg, STATE_DIR=steady(
+    os.path.join(work, "sig_sensitive"))))
+for probe in ("/wp-config.php", "/.ssh/id_rsa", "/.aws/credentials",
+              "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+              "/actuator/env", "/server-status", "/.svn/entries",
+              "/adminer.php", "/backup.old"):
+    check("sensitive: " + probe + " is recognised",
+          bool(sensitive_pe.sensitive_pattern.search(probe)))
+check("sensitive: /.well-known/ is NOT - ACME renewal lives there",
+      not sensitive_pe.sensitive_pattern.search(
+          "/.well-known/acme-challenge/tokenvalue"))
+
+# --- N6 bandwidth at the /56 tier -------------------------------------------
+wide_bw = {}
+for n in range(10):
+    wide_bw["2a03:2880:f800:%x::/64" % n] = {"hits": 20, "bw": 40 * 1024 * 1024}
+v = verdict_for("v6bw", wide_bw, {"SUBNET6_WIDE_DETECTION": "1",
+                                  "SUBNET_DETECTION": "1"})
+wide_hit = [k for k in v if k.endswith("::/56")]
+check("v6 wide bw: a /56 draining bandwidth is caught at all",
+      bool(wide_hit), sorted(v))
+check("v6 wide bw: reported as Subnet6HighBandwidth",
+      bool(wide_hit) and "Subnet6HighBandwidth" in v[wide_hit[0]]["reason"],
+      v[wide_hit[0]]["reason"] if wide_hit else "absent")
+
+# ============================================================== catch-up guard
+#
+# The one way an ordinary visitor crosses a volume threshold without having done
+# anything: hand a single run hours of log and every count in it is inflated by
+# the same factor. Replaces MAX_NEW_BLOCKS_PER_RUN, which measured the outcome
+# rather than the cause.
+#
+# The span is MEASURED from the stamps of the lines just read. That is what
+# separates "the host was off for four hours" (no log was written, span zero)
+# from "one run swallowed four hours of traffic".
+
+VOLUME_IP = "45.20.10.10"      # volume only
+INTENT_IP = "45.20.10.11"      # volume AND intent
+
+
+def catchup_log(name, span_seconds, seed_last_run=None, guard="1"):
+    """Writes a log covering `span_seconds` and runs the real audit path."""
+    cu_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
+                  CLIENT_PROFILING="0", CATCHUP_GUARD=guard)
+    cu_state = os.path.join(work, "cu_" + name)
+    os.makedirs(cu_state, exist_ok=True)
+    if seed_last_run is not None:
+        with open(os.path.join(cu_state, "run_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"last_run": seed_last_run}, f)
+    cu_cfg["STATE_DIR"] = cu_state
+
+    path = os.path.join(work, "cu_" + name + ".log")
+    rows = 20
+    step = span_seconds // max(rows - 1, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(rows):
+            when = stamp_now(-(span_seconds - i * step) - 60)
+            f.write('%s - - [%s] "GET /index.html HTTP/1.1" 200 100 "-" "curl/8"\n'
+                    % (VOLUME_IP, when))
+            f.write('%s - - [%s] "POST /wp-login.php HTTP/1.1" 401 100 "-" "curl/8"\n'
+                    % (INTENT_IP, when))
+
+    pe = log_parser.LogParserEngine(cu_cfg)
+    pe.discover_log_files = lambda *a, **k: [path]
+    pe.discover_auth_logs = lambda *a, **k: []
+    ae = apply_engine.ApplyEngine(cu_cfg)
+    ae.audit.parser = pe
+    pe.cdn_check = ae.guard.is_cdn_edge_ip
+    return ae.audit.evaluate_candidates(), pe
+
+
+now_i = int(time.time())
+
+# --- ordinary run: 20 lines inside two minutes
+v, pe = catchup_log("steady", 120, seed_last_run=now_i - 60)
+check("catchup: a two-minute span is not a catch-up", not pe.catchup, pe.catchup_reason)
+check("catchup: steady run blocks the volume offender", VOLUME_IP in v, sorted(v))
+check("catchup: steady run blocks the intent offender", INTENT_IP in v, sorted(v))
+
+# --- one run swallows three hours
+v, pe = catchup_log("wide", 3 * 3600, seed_last_run=now_i - 60)
+check("catchup: a three-hour span IS a catch-up", pe.catchup, pe.catchup_reason)
+check("catchup: the reason states the measured minutes",
+      "minutes of log" in pe.catchup_reason, pe.catchup_reason)
+check("catchup: volume alone is NOT blocked on a catch-up run",
+      VOLUME_IP not in v, sorted(v))
+check("catchup: intent IS still blocked on a catch-up run", INTENT_IP in v, sorted(v))
+check("catchup: the verdict is the brute force, not the volume",
+      "BruteForce" in v.get(INTENT_IP, {}).get("reason", ""), v.get(INTENT_IP))
+
+# --- the scenario the gap-based guess got wrong: host powered off for four
+#     hours. Nothing was served while it was down, so the log it comes back to
+#     holds two minutes of traffic, not four hours of it.
+v, pe = catchup_log("host_was_off", 120, seed_last_run=now_i - 4 * 3600)
+check("catchup: a four-hour outage with a two-minute span is NOT a catch-up",
+      not pe.catchup, pe.catchup_reason)
+check("catchup: so volume detection keeps working after a reboot",
+      VOLUME_IP in v, sorted(v))
+
+# --- measurement recorded for the operator
+# 20 rows across 120 seconds land on a 6-second grid, so the measured span is
+# 19 steps rather than a round 120 — the point is that it is MEASURED.
+check("catchup: the measured span is exposed",
+      110 <= pe.span_end - pe.span_start <= 120, pe.span_end - pe.span_start)
+check("catchup: every line contributed a usable stamp",
+      pe.stamped == 40 and pe.unstamped == 0, (pe.stamped, pe.unstamped))
+
+# --- guard disabled
+v, pe = catchup_log("off", 3 * 3600, seed_last_run=now_i - 60, guard="0")
+check("catchup: the guard can be switched off", not pe.catchup)
+check("catchup: with the guard off, a wide span still blocks on volume",
+      VOLUME_IP in v, sorted(v))
+
+# --- fallback: a log whose stamps cannot be read at all
+fb_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
+              CLIENT_PROFILING="0")
+fb_state = os.path.join(work, "cu_nostamp")
+os.makedirs(fb_state, exist_ok=True)
+fb_cfg["STATE_DIR"] = fb_state
+fb_log = os.path.join(work, "cu_nostamp.log")
+with open(fb_log, "w", encoding="utf-8") as f:
+    for _ in range(20):
+        f.write('%s - - [not-a-date] "GET /index.html HTTP/1.1" 200 100 "-" "curl/8"\n'
+                % VOLUME_IP)
+fb_pe = log_parser.LogParserEngine(fb_cfg)
+fb_pe.discover_log_files = lambda *a, **k: [fb_log]
+fb_pe.discover_auth_logs = lambda *a, **k: []
+fb_ae = apply_engine.ApplyEngine(fb_cfg)
+fb_ae.audit.parser = fb_pe
+fb_pe.cdn_check = fb_ae.guard.is_cdn_edge_ip
+fb_v = fb_ae.audit.evaluate_candidates()
+check("catchup: unreadable stamps fall back to the run gap", fb_pe.catchup,
+      fb_pe.catchup_reason)
+check("catchup: those lines still counted, using the run clock",
+      fb_pe.unstamped == 20 and fb_pe.stamped == 0,
+      (fb_pe.stamped, fb_pe.unstamped))
+
 
 print()
 if failures:

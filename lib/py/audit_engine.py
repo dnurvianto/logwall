@@ -82,13 +82,71 @@ class AuditEngine:
             if count > threshold_401:
                 consider(ip, f"PanelBruteForce | 401/403 | Hits: {count}x", TIER_PERMANENT)
 
+        # A self-declared offensive tool. The name alone is the evidence: none of
+        # ATTACK_UA_MARKERS has a legitimate use against somebody else's server.
+        # Deliberately separate from the generic script list — curl, wget and
+        # python-requests are honest API clients and blocking them would take out
+        # the operator's own integrations.
+        threshold_attack_ua = get_int(self.config, "THRESHOLD_ATTACK_UA", 1)
+        for ip, count in metrics.get("attack_ua", {}).items():
+            if count >= threshold_attack_ua:
+                consider(ip, f"ToolSignature | offensive scanner UA | Hits: {count}x",
+                         TIER_PERMANENT)
+
+        # Intent that stayed under every individual threshold but is unmistakable
+        # once added up. The /24 rollup has summed these four since 1.0; a single
+        # address was judged more leniently than its own neighbours until now.
+        threshold_intent_ip = get_int(self.config, "THRESHOLD_INTENT_IP", 8)
+        for ip in metrics["hits"]:
+            intent = (metrics["wp_login"].get(ip, 0)
+                      + metrics["xmlrpc"].get(ip, 0)
+                      + metrics["scan"].get(ip, 0)
+                      + metrics["panel_401"].get(ip, 0))
+            if intent > threshold_intent_ip:
+                consider(ip, f"IntentComposite | brute force/recon: {intent}x",
+                         TIER_PERMANENT)
+
         self._calibrate_client_profiling(metrics)
+
+        # Path brute force. Directory scanners produce 404 by the thousand, and
+        # until now only 401/403 was counted — so gobuster and feroxbuster, whose
+        # names logwall already recognised, were invisible.
+        #
+        # The ratio condition is not optional. A site with a broken theme or a
+        # missing favicon serves 404s to real visitors, and without the ratio
+        # this rule would convict the victims of the operator's own bug.
+        threshold_404 = get_int(self.config, "THRESHOLD_404", 30)
+        ratio_404_min = float(self.config.get("RATIO_404_MIN", 0.60) or 0.60)
+        for ip, count in metrics.get("panel_404", {}).items():
+            hits = metrics["hits"].get(ip, 0)
+            if count <= threshold_404 or hits <= 0 or self._volume_suspended():
+                continue
+            ratio = count / hits
+            if ratio < ratio_404_min:
+                continue
+            profile, label = self._client_profile(ip, metrics)
+            consider(ip, f"PathBruteForce | 404: {count}x of {hits} ({ratio:.0%}){label}",
+                     self._volume_tier(count, threshold_404, profile))
+
+        # Login attempts outside WordPress. Only POST counts — a GET of /login is
+        # the form itself, and counting it would flag everyone who looked at it.
+        threshold_login_post = get_int(self.config, "THRESHOLD_LOGIN_POST", 10)
+        for ip, count in metrics.get("login_post", {}).items():
+            if count <= threshold_login_post or self._volume_suspended():
+                continue
+            # A real user who forgot their password does post repeatedly. What
+            # they do not do is collect rejections while doing it.
+            rejected = metrics["panel_401"].get(ip, 0)
+            tier = TIER_PERMANENT if rejected > 0 else self._volume_tier(
+                count, threshold_login_post)
+            consider(ip, f"GenericLoginBrute | login POST: {count}x"
+                         f"{f' | rejected: {rejected}x' if rejected else ''}", tier)
 
         threshold_hits = get_int(self.config, "THRESHOLD_HITS", 40)
         for ip, count in metrics["hits"].items():
             profile, label = self._client_profile(ip, metrics)
             effective = self._effective_threshold(threshold_hits, profile)
-            if count > effective:
+            if count > effective and not self._volume_suspended():
                 consider(ip, f"CloudScraper | WebApp | Hits: {count}x{label}",
                          self._volume_tier(count, threshold_hits, profile))
 
@@ -96,7 +154,7 @@ class AuditEngine:
         for ip, total in metrics["bw"].items():
             profile, label = self._client_profile(ip, metrics)
             effective = self._effective_threshold(threshold_bw, profile)
-            if total > effective:
+            if total > effective and not self._volume_suspended():
                 mb = total / 1024 / 1024
                 hits = metrics["hits"].get(ip, 0)
                 consider(ip, f"HighBandwidth | BW: {mb:.1f}MB | Hits: {hits}x{label}",
@@ -123,8 +181,8 @@ class AuditEngine:
         networks = self._evaluate_subnets()
 
         # A member address covered by a blocked range must not be listed twice.
-        # This is what turns "500 candidates, circuit breaker tripped" into
-        # "2 candidates, blocked on the first cycle".
+        # This is what turns 500 separate candidates into 2 entries that say what
+        # actually happened: one source, not five hundred.
         if networks:
             nets = []
             for cidr in networks:
@@ -144,6 +202,24 @@ class AuditEngine:
             allowed.update(networks)
 
         return allowed
+
+    def _volume_suspended(self):
+        """
+        True on a catch-up run, where every volume count is inflated by however
+        much log the run happened to swallow.
+
+        This replaces MAX_NEW_BLOCKS_PER_RUN, which counted the OUTCOME —
+        candidates produced — and could never tell "many genuine offenders" from
+        "the input was distorted". It capped both alike, and in the only two
+        cases it ever fired, both were genuine.
+
+        The suspension is deliberately narrow. Intent detections keep running:
+        five probes for /.env are five probes whether they arrived over two
+        minutes or two days, so a catch-up run still blocks brute force, recon,
+        and self-declared scanners. Only counts that mean nothing without a
+        known time span are held back, and only for this run.
+        """
+        return bool(getattr(self.parser, "catchup", False))
 
     def _volume_tier(self, value, threshold, profile=PROFILE_UNKNOWN):
         """
@@ -276,12 +352,12 @@ class AuditEngine:
                 reason = (f"SubnetCoordinatedAttack | {members} hosts | "
                           f"brute force/recon: {intent}x")
                 tier = TIER_PERMANENT
-            elif agg["bw"] > threshold_bw:
+            elif agg["bw"] > threshold_bw and not self._volume_suspended():
                 mb = agg["bw"] / 1024 / 1024
                 reason = (f"SubnetHighBandwidth | {members} hosts | "
                           f"BW: {mb:.1f}MB | Hits: {agg['hits']}x")
                 tier = self._volume_tier(agg["bw"], threshold_bw)
-            elif agg["hits"] > threshold_hits:
+            elif agg["hits"] > threshold_hits and not self._volume_suspended():
                 total = agg["pages"] + agg["assets"]
                 ratio = (agg["assets"] / total) if total else 0.0
                 profile = PROFILE_UNKNOWN
@@ -334,6 +410,7 @@ class AuditEngine:
         max_width = get_int(self.config, "SUBNET6_WIDE_MAX_WIDTH", 56)
 
         threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS", 2000)
+        threshold_bw = get_int(self.config, "THRESHOLD_SUBNET_BW_MB", 300) * 1024 * 1024
         threshold_auth = get_int(self.config, "THRESHOLD_SUBNET_AUTH", 20)
         threshold_intent = get_int(self.config, "THRESHOLD_SUBNET_INTENT", 20)
 
@@ -355,6 +432,16 @@ class AuditEngine:
                 reason = (f"Subnet6CoordinatedAttack | {members} /64s | "
                           f"brute force/recon: {intent}x")
                 tier = TIER_PERMANENT
+            elif self._volume_suspended():
+                continue
+            elif agg["bw"] > threshold_bw:
+                # The /24 tier has had a bandwidth rule since 1.0; this tier did
+                # not, so an IPv6 source draining bandwidth across many /64s was
+                # caught at no level at all.
+                mb = agg["bw"] / 1024 / 1024
+                reason = (f"Subnet6HighBandwidth | {members} /64s | "
+                          f"BW: {mb:.1f}MB | Hits: {agg['hits']}x")
+                tier = self._volume_tier(agg["bw"], threshold_bw)
             elif agg["hits"] > threshold_hits:
                 reason = f"Subnet6Flood | {members} /64s | Hits: {agg['hits']}x"
                 tier = self._volume_tier(agg["hits"], threshold_hits)
@@ -389,6 +476,15 @@ class AuditEngine:
         flags["GUARD_STATS"] = dict(self.guard.stats)
         if getattr(self, "flags_extra", None):
             flags["PROFILING_OFF"] = self.flags_extra
+        if getattr(self.parser, "catchup", False):
+            # Stated out loud on every channel. The circuit breaker this
+            # replaced announced itself only on stderr, which cron discards, and
+            # no report ever mentioned it — so a host could refuse to block
+            # anything for hours and look perfectly healthy.
+            flags["CATCHUP_RUN"] = (
+                "Volume rules suspended for this run: {}. Intent detections "
+                "(brute force, recon, scanner signatures) still applied."
+                .format(self.parser.catchup_reason))
         return flags
 
     def commit_state(self):
@@ -432,6 +528,8 @@ def main():
                   file=sys.stderr)
         if flags.get("PROFILING_OFF"):
             print(flags["PROFILING_OFF"], file=sys.stderr)
+        if flags.get("CATCHUP_RUN"):
+            print(f"[CATCHUP_RUN] {flags['CATCHUP_RUN']}", file=sys.stderr)
 
     # Exit 1 means "findings present", not failure (docs/DESIGN.md §18).
     return 1 if candidates else 0

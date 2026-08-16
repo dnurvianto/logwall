@@ -2,6 +2,171 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.1.0-rc1 — 2026-08-16 (the blocking cap is gone; six detections added)
+
+An audit of the verdict path, prompted by a question that turned out to have no
+good answer: what scenario is `MAX_NEW_BLOCKS_PER_RUN` for?
+
+### The circuit breaker was removed
+
+Every entry reaching the apply stage comes from `evaluate_candidates()` and has
+already passed every guard — whitelist, CDN, DDNS, the host's own addresses, the
+prefix-width ceiling. There is no other path into that list. So the cap could
+only ever mean one thing: *the tool does not trust its own signals*. If that is
+true, the signals are what need fixing.
+
+Its record over the project's life:
+
+| Event | What happened | What actually fixed it |
+|---|---|---|
+| 500 real addresses, one incident | tripped, blocked nothing | `/24` aggregation |
+| 70 `/64`s of one crawler | tripped, blocked nothing | `/56` aggregation |
+| a threshold regression | never tripped — the damage was gradual | nothing; it was invisible to a counter |
+
+Two firings, both wrong, and blind to the one case that mattered. Three further
+faults, each enough on its own:
+
+- **It did not pause; it deadlocked.** State was committed as it aborted, so the
+  same candidates returned two minutes later and tripped it again. The only exit
+  was a human typing `apply --force-breaker`, which cron never passes.
+- **It was silent.** `[BREAKER_TRIPPED]` went to stderr, cron discards stderr,
+  and `report_gen.py` had zero references to it. A host could refuse to block
+  anything for hours and look perfectly healthy.
+- **It released the guilty along with the rest.** The abort cancelled the whole
+  batch, intent verdicts included — sqlmap, SSH brute force, `.env` probes.
+
+Measured on a production host (599,701 log lines, 1,298 addresses): of 78
+addresses that a cumulative threshold would catch, **75 were already over the
+limit inside a single two-minute interval**. The three that were not: the host's
+own address, an uptime monitor, and a steady 6-requests-per-interval drip.
+
+`MAX_NEW_BLOCKS_PER_RUN`, `EXIT_BREAKER` (exit code 6) and `--force-breaker` are
+gone from the config, the CLI and the design document.
+
+### Replaced by a guard that measures the cause
+
+The hazard the breaker was groping at is real, but it is not "too many
+candidates" — it is **time distortion**. A run that ingests hours of log instead
+of one interval inflates every volume count by the same factor, and then ordinary
+visitors cross a volume threshold without having done anything. It happens on a
+fresh install (no cursor exists, so the whole existing log is read from byte
+zero), after a cursor reset, and whenever cron stalled or the host was off.
+
+`CATCHUP_GUARD` compares the gap since the previous run against
+`CATCHUP_MAX_GAP_MIN` (default 15 minutes). On a catch-up run:
+
+- **volume** detections stand down — hits, bandwidth, 404 storms, login POSTs,
+  and the subnet flood and bandwidth rollups
+- **intent** detections keep firing — brute force, recon, failed logins, scanner
+  signatures. Five probes for `/.env` are five probes whether they arrived over
+  two minutes or two days
+- the run reports `CATCHUP_RUN` on stdout, in the daily report, and in
+  `state/run_meta.json` — the visibility its predecessor never had
+
+### The parser now reads the log's own clock
+
+`COMBINED_RE` matched the `[timestamp]` field and threw it away — no capture
+group — and Caddy's `ts` was never read either. Every counter was therefore
+stamped with the wall clock at the moment of the run, so `window.json` recorded
+when logwall *looked*, not when the visitor *arrived*.
+
+Two things follow from fixing it.
+
+**The catch-up guard measures instead of guessing.** It compares the span of the
+data a run actually swallowed against `CATCHUP_MAX_GAP_MIN`. The difference is
+not academic: a host powered off for four hours wrote no log at all while it was
+down, so the gap between runs is four hours and the span of the data is two
+minutes. Keying on the gap would suspend the volume rules for nothing; keying on
+the span does not. The gap survives only as a fallback for logs whose stamps
+cannot be read.
+
+**The window ages on request time.** `prune()` drops entries older than
+`WINDOW_HOURS` measured from the request, so the first run on a host — which
+reads the whole existing log from byte zero — no longer treats a week of history
+as if it had all arrived at once. A stamp ahead of the clock, or far enough
+behind that it would resurrect an entry `prune()` is about to drop, falls back to
+the run clock rather than being trusted.
+
+Service auth logs keep the run clock: their syslog stamp carries no year, and the
+only rule that reads them is a plain count.
+
+Cost, measured over five runs of the full pipeline: **1.83s → 1.84s per 40,000
+lines**, under 1%. Stamps are converted per distinct *second* rather than per
+line, because a busy log puts hundreds of requests inside the same second — the
+conversion alone is 1.53s per 300k lines uncached and 0.69s cached, against 0.45s
+for discarding the field.
+
+### Six detections added
+
+The audit found that logwall was blind in places its own vocabulary already
+covered.
+
+**`IntentComposite`** — `wp-login` + `xmlrpc` + sensitive-file + `401/403`,
+summed for one address (`THRESHOLD_INTENT_IP`, default 8). The `/24` rollup has
+summed these four since 1.0, so a lone attacker was judged *more leniently than
+its own neighbours*: 5 wp-login + 2 xmlrpc + 2 recon + 5 rejections passed every
+individual threshold and was never even a candidate.
+
+**`ToolSignature`** — an explicit offensive-scanner User-Agent
+(`THRESHOLD_ATTACK_UA`, default 1). The marker list was recorded in every window
+entry since 1.0 and used only to decorate a reason string with
+`(self-declared)`.
+
+The list was **split first**, and that split is the load-bearing part:
+`SCRIPT_UA_GENERIC` (curl, wget, python-requests, axios, okhttp, scrapy, …)
+informs the browser-vs-script profile and can never justify a block, because
+every one of them is somebody's honest API client. `ATTACK_UA_MARKERS` (sqlmap,
+nikto, wpscan, nuclei, masscan, zgrab, dirbuster, gobuster, feroxbuster) is the
+blocking signal. Blocking the first list would have taken out the operator's own
+integrations. An absent User-Agent counts as neither.
+
+**`PathBruteForce`** — 404 responses (`THRESHOLD_404`, default 30) **and** a
+minimum share of the address's requests (`RATIO_404_MIN`, default 0.60). Only
+401/403 was counted before, so gobuster and feroxbuster — names logwall already
+recognised — produced nothing. The ratio condition is mandatory: a site with a
+broken theme serves 404s to real visitors, and without it the rule would convict
+the victims of the operator's own bug.
+
+**`GenericLoginBrute`** — POSTs to a login endpoint outside WordPress
+(`THRESHOLD_LOGIN_POST` default 10, `LOGIN_PATHS` configurable). Only
+`wp-login.php` and `xmlrpc.php` were ever hardcoded; `/login`, `/admin`,
+`/api/auth` and every framework's own path had no rule at all. GETs are not
+counted — a GET of `/login` is the form. Temporary unless the same address also
+collected rejections, because a real user who forgot their password does post
+repeatedly.
+
+**Sensitive-file list widened** from five tokens to twenty-two: `wp-config.php`,
+`.htpasswd`, `.ssh/`, `id_rsa`, `.aws/`, `.svn/`, `/vendor/`, `/actuator`,
+`/server-status`, `.DS_Store`, `config.json`, `.npmrc`, `.dockercfg`,
+`docker-compose.yml`, `/phpinfo`, `/adminer`, `.old`, `.orig`.
+`/.well-known/` is deliberately excluded — ACME renewal lives there, and
+flagging it would have the tool block its own certificate renewal.
+
+**`Subnet6HighBandwidth`** — the `/56` tier had rules for failed logins, intent
+and request volume but none for bandwidth, which the `/24` tier has had since
+1.0. An IPv6 source draining bandwidth across many `/64`s was caught at no level
+at all.
+
+### Removed
+
+`THRESHOLD_PANEL_HITS` was listed in the config and in §7 of the design document
+and **read by no code**. It is deleted rather than implemented: `PanelBruteForce`
+already covers the case through 401/403, and inventing a rule to justify a
+setting name is the wrong direction. A scan of the whole config against the whole
+codebase found 20 keys in that state; the rest are recorded and will be resolved
+one at a time rather than in a batch.
+
+### Tests
+
+144 → 190 offline checks. The fixtures keep their fixed dates — they are meant
+to be read — so the suite now shifts every stamp forward at run time; without
+that, a fixture written last week correctly produces nothing at all, which is
+itself a demonstration that the window is finally aging on the right clock. The new ones cover each detection above, the ordering
+that makes an intent verdict win over a volume one for the same address, the
+`/.well-known/` exclusion, that `curl` is not an attack signature, that 400
+candidates in one run all block, and that a catch-up run suspends volume while
+intent still fires.
+
 ## 1.0.0-rc10 — 2026-08-16 (IPv6 counted correctly; scope tightened)
 
 Everything here came from one thing: installing on a host that had never seen this

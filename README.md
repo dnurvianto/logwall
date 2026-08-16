@@ -73,8 +73,10 @@ This is the part that took the most work, and it is the reason to choose it.
   rolls the host back to exactly how it was.
 - **Deadman switch** — after `apply`, an automatic rollback is armed. If you
   cannot run `logwall firewall confirm`, the server restores itself.
-- **Circuit breaker** — an unnatural spike in candidates aborts the run and
-  blocks nothing. A parser fault must never become a mass outage.
+- **Catch-up guard** — when a run reads hours of log instead of one interval
+  (a fresh install, a cursor reset, a stalled cron), every volume count in it is
+  inflated, so the volume rules stand down for that run and the intent rules
+  carry on. The run says so in the report.
 - **Observe-only by default** — `ENFORCE=0` on a fresh install. It watches and
   builds the list; it drops nothing until you have read the result and said so.
 - **Coexists** — detects other agents and defers to them. With `BACKEND=csf` it
@@ -108,8 +110,8 @@ candidates produced          : 2
 185.199.8.0/24    PERMANENT  SubnetFlood | 250 hosts | Hits: 500000x | assets 0%
 ```
 
-Five hundred candidates become two. The circuit breaker never trips, so blocking
-actually happens. `assets 0%` is the client profile: not one of those 500
+Five hundred candidates become two, and both are blocked. `assets 0%` is the
+client profile: not one of those 500
 addresses ever fetched a stylesheet, a script or an image — no browser behaves
 that way. Excess this far past the threshold is not ambiguous either, so both
 ranges skip the temporary tier and land permanently on first sighting.

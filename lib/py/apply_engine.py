@@ -3,9 +3,9 @@
 # Project: logwall — Cross-Distro & Cross-Panel Server Firewall Automation
 # Module: lib/py/apply_engine.py
 # Purpose: Turns audited candidates into blacklist entries. Owns the escalation
-#          ladder (TEMP -> PERMANENT), deduplication, circuit breaker, and the
-#          generation of an atomic `ipset restore` script for the Bash layer.
-# Reference: docs/DESIGN.md §7 (apply), §12 (Escalation), §16.4 (Circuit Breaker)
+#          ladder (TEMP -> PERMANENT), deduplication, and the generation of an
+#          atomic `ipset restore` script for the Bash layer.
+# Reference: docs/DESIGN.md §7 (apply), §12 (Escalation)
 # ==============================================================================
 
 import argparse
@@ -23,7 +23,6 @@ from ip_guard import load_networks
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
-EXIT_BREAKER = 6
 
 # Defaults are deliberately prefixed. Generic names such as BLACKLIST_SET belong
 # to first-generation blocker scripts, and swapping a set logwall did not create
@@ -121,7 +120,6 @@ class ApplyEngine:
         self.state_dir = get_path(self.config, "STATE_DIR", "/opt/logwall/data/state")
         self.history_file = os.path.join(self.state_dir, "offender_history.json")
 
-        self.max_new_blocks = get_int(self.config, "MAX_NEW_BLOCKS_PER_RUN", 50)
         self.temp_hours = get_int(self.config, "TEMP_BLOCK_HOURS", 48)
         self.maxelem = get_int(self.config, "IPSET_MAXELEM", 262144)
         self.capacity_alert = get_int(self.config, "IPSET_CAPACITY_ALERT_PCT", 80)
@@ -186,7 +184,7 @@ class ApplyEngine:
         return entries
 
     # ------------------------------------------------------------------ apply
-    def execute(self, force_breaker=False, dry_run=False):
+    def execute(self, dry_run=False):
         now = int(time.time())
         candidates = self.audit.evaluate_candidates()
         entries = self.load_blacklist()
@@ -222,22 +220,19 @@ class ApplyEngine:
             expires = now + self.temp_hours * 3600 if tier == TIER_TEMP else None
             pending.append(BlacklistEntry(ip, date_str, reason, tier, strike, expires))
 
-        # 3. Circuit breaker: an unnatural spike is a parser or configuration
-        #    fault far more often than a synchronised attack (docs/DESIGN.md §16.4).
-        if len(pending) > self.max_new_blocks and not force_breaker:
-            print(f"[BREAKER_TRIPPED] {len(pending)} new candidates exceed "
-                  f"MAX_NEW_BLOCKS_PER_RUN={self.max_new_blocks}. No IP was blocked.",
-                  file=sys.stderr)
-            for entry in pending[:20]:
-                print(f"[BREAKER_TRIPPED]   {entry.target} -> {entry.reason}",
-                      file=sys.stderr)
-            # State is still committed: the counters are real, and the same
-            # candidates will be presented again on the next run.
-            if not dry_run:
-                self.audit.commit_state()
-                self.save_history(history)
-            return EXIT_BREAKER, entries
-
+        # 3. Every entry in `pending` came from a detection signal and has
+        #    already passed every guard inside evaluate_candidates(). There is no
+        #    other path into this list, so a large batch means a large number of
+        #    offenders — not a fault. Capping it would only ever mean refusing to
+        #    act on the tool's own findings.
+        #
+        #    A circuit breaker used to sit here and abort the whole run above
+        #    MAX_NEW_BLOCKS_PER_RUN. It fired twice in production, both times on
+        #    genuine abuse, blocking nothing while the attack continued — and it
+        #    committed state as it went, so the same candidates returned two
+        #    minutes later and tripped it again, silently, until a human noticed.
+        #    Distorted input is now caught at the source instead: see
+        #    LogParserEngine._detect_catchup().
         for entry in pending:
             entries[entry.target] = entry
             history.setdefault(entry.target, {})["strike"] = entry.strike
@@ -432,6 +427,8 @@ class ApplyEngine:
                   file=sys.stderr)
         if flags.get("LOG_NOT_FOUND"):
             print(f"{prefix}[LOG_NOT_FOUND] No access log discovered.", file=sys.stderr)
+        if flags.get("CATCHUP_RUN"):
+            print(f"{prefix}[CATCHUP_RUN] {flags['CATCHUP_RUN']}")
 
         print(f"{prefix}[SUMMARY] new={len(self.added)} expired={len(self.expired)} "
               f"escalated={len(self.escalated)} total={len(entries)}")
@@ -449,8 +446,6 @@ def _atomic_write(path, content):
 
 def main():
     parser = argparse.ArgumentParser(description="logwall apply engine")
-    parser.add_argument("--force-breaker", action="store_true",
-                        help="proceed even when the circuit breaker trips")
     parser.add_argument("--dry-run", action="store_true",
                         help="show what would change without writing anything")
     parser.add_argument("--emit-ipset", metavar="PATH",
@@ -460,8 +455,7 @@ def main():
     args = parser.parse_args()
 
     engine = ApplyEngine()
-    code, entries = engine.execute(force_breaker=args.force_breaker,
-                                   dry_run=args.dry_run)
+    code, entries = engine.execute(dry_run=args.dry_run)
 
     if not args.dry_run:
         if args.emit_ipset:
