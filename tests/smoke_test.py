@@ -53,12 +53,15 @@ BLACKLIST={work}/blacklist.txt
 SKIP_LIST={work}/bypass.txt
 CDN_NETS_FILE={work}/cdn.txt
 STATE_DIR={state}
-THRESHOLD_HITS=10
+THRESHOLD_HITS_PER_INTERVAL=10
+STRIKES_REQUIRED=2
+STRIKES_WINDOW=10
+INTENT_WINDOW_MIN=30
+EVAL_INTERVAL_SEC=120
 THRESHOLD_WP_LOGIN=3
 THRESHOLD_XMLRPC=2
 THRESHOLD_SENSITIVE_SCAN=2
-THRESHOLD_BW_MB=1
-WINDOW_HOURS=24
+THRESHOLD_BW_MB_PER_INTERVAL=1
 CATCHUP_MAX_GAP_MIN=15
 TEMP_BLOCK_HOURS=48
 BLOCK_ESCALATION=1
@@ -91,7 +94,9 @@ def check(label, condition, detail=""):
 
 # ---------------------------------------------------------------- config
 cfg = config_loader.load_config(conf)
-check("config: file is parsed", cfg.get("THRESHOLD_HITS") == "10", cfg.get("THRESHOLD_HITS"))
+check("config: file is parsed",
+      cfg.get("THRESHOLD_HITS_PER_INTERVAL") == "10",
+      cfg.get("THRESHOLD_HITS_PER_INTERVAL"))
 check("config: inline comment stripped",
       cfg.get("GOOGLE_BOT_NETS") == "66.249.64.0/19", repr(cfg.get("GOOGLE_BOT_NETS")))
 check("config: quoted value with spaces kept",
@@ -133,10 +138,11 @@ log_path = write("access.log", "")
 attacker = "185.199.108.153"
 
 
-def append_hits(count, uri="/index.html", status=200, size=100):
+def append_hits(count, uri="/index.html", status=200, size=100, ago=60):
+    """`ago` places the lines in a chosen interval, counted back from now."""
     with open(log_path, "a", encoding="utf-8") as f:
         for _ in range(count):
-            f.write(f'{attacker} - - [{stamp_now()}] "GET {uri} HTTP/1.1" '
+            f.write(f'{attacker} - - [{stamp_now(-ago)}] "GET {uri} HTTP/1.1" '
                     f'{status} {size} "-" "curl/8"\n')
 
 
@@ -220,6 +226,15 @@ check("comment: shell metacharacters stripped for ipset",
 # volume rules, which is the behaviour tested further down.
 with open(os.path.join(state, "run_meta.json"), "w", encoding="utf-8") as f:
     json.dump({"last_run": int(time.time()) - 60}, f)
+
+# Volume needs repetition now. 12 hits in one interval is a visitor opening a
+# couple of pages; 12 in each of two intervals is a pattern. The first burst
+# above already sits in one interval, so one more interval completes the case.
+append_hits(12, ago=200)
+seed = log_parser.LogParserEngine(cfg)
+seed.cdn_check = guard.is_cdn_edge_ip
+seed.analyze_traffic([log_path])
+seed.save_state()
 
 engine = apply_engine.ApplyEngine(cfg)
 engine.audit.parser.discover_log_files = lambda *a, **k: []
@@ -516,29 +531,32 @@ check("profile: browser client counted mostly assets",
       mp["assets"].get("203.0.113.201") == 4 and mp["pages"].get("203.0.113.201") == 1,
       (mp["assets"].get("203.0.113.201"), mp["pages"].get("203.0.113.201")))
 check("profile: scraper with a Chrome UA fetched ZERO assets",
-      mp["assets"].get("185.199.120.10") == 0 and mp["pages"].get("185.199.120.10") == 5,
-      (mp["assets"].get("185.199.120.10"), mp["pages"].get("185.199.120.10")))
+      mp["assets"].get("185.199.120.10", 0) == 0 and mp["pages"].get("185.199.120.10") == 5,
+      (mp["assets"].get("185.199.120.10", 0), mp["pages"].get("185.199.120.10")))
 check("profile: self-declared tool is flagged even though volume is low",
       mp["script_ua"].get("185.199.120.11") == 2, mp["script_ua"])
 
 # Same request count, opposite verdict — this is the whole point.
 prof2 = dict(prof_cfg)
-prof2["THRESHOLD_HITS"] = "4"
+prof2["THRESHOLD_HITS_PER_INTERVAL"] = "4"
 prof2["SUBNET_DETECTION"] = "0"
 prof2["BROWSER_TOLERANCE_FACTOR"] = "3"
 pe2 = log_parser.LogParserEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof2"))))
 pe2.discover_log_files = lambda *a, **k: []
 pe2.discover_auth_logs = lambda *a, **k: []
 now_p = int(time.time())
-for _ in range(5):                       # browser: 5 pages + 40 assets
-    pe2.window.add("203.0.113.210", "hits", 1, now_p)
-    pe2.window.add("203.0.113.210", "pages", 1, now_p)
-for _ in range(40):
-    pe2.window.add("203.0.113.210", "hits", 1, now_p)
-    pe2.window.add("203.0.113.210", "assets", 1, now_p)
-for _ in range(45):                      # script: 45 pages, no assets
-    pe2.window.add("185.199.121.9", "hits", 1, now_p)
-    pe2.window.add("185.199.121.9", "pages", 1, now_p)
+# Spread over two intervals: volume rules require repetition, and a client that
+# is loud in a single interval is a visitor by construction.
+for slot in (now_p, now_p - 200):
+    for _ in range(5):                   # browser: 5 pages + 40 assets
+        pe2.window.add("203.0.113.210", "hits", 1, slot)
+        pe2.window.add("203.0.113.210", "pages", 1, slot)
+    for _ in range(40):
+        pe2.window.add("203.0.113.210", "hits", 1, slot)
+        pe2.window.add("203.0.113.210", "assets", 1, slot)
+    for _ in range(45):                  # script: 45 pages, no assets
+        pe2.window.add("185.199.121.9", "hits", 1, slot)
+        pe2.window.add("185.199.121.9", "pages", 1, slot)
 
 ae2 = apply_engine.ApplyEngine(dict(prof2, STATE_DIR=steady(os.path.join(work, "prof2"))))
 ae2.audit.parser = pe2
@@ -601,7 +619,10 @@ def run_escalation(hits, blacklist_body=None, history=None):
     pe.discover_log_files = lambda *a, **k: []
     pe.discover_auth_logs = lambda *a, **k: []
     if hits:
+        # Two intervals, because the escalation ladder is about REPEAT offences
+        # and a volume verdict now needs repetition before it exists at all.
         pe.window.add(REPEAT, "hits", hits, now_e)
+        pe.window.add(REPEAT, "hits", hits, now_e - 200)
     ee = apply_engine.ApplyEngine(esc_cfg)
     ee.audit.parser = pe
     pe.cdn_check = ee.guard.is_cdn_edge_ip
@@ -610,7 +631,7 @@ def run_escalation(hits, blacklist_body=None, history=None):
 
 
 # First offence: modest excess (500 vs threshold 10 = 50x)... use a small excess
-esc_cfg["THRESHOLD_HITS"] = "400"
+esc_cfg["THRESHOLD_HITS_PER_INTERVAL"] = "400"
 eng_a, ents_a = run_escalation(500, blacklist_body="", history={})
 check("escalation: first volume offence is TEMPORARY",
       ents_a[REPEAT].tier == "TEMP" and ents_a[REPEAT].strike == 1,
@@ -642,7 +663,8 @@ zero_cfg["BLOCK_ESCALATION"] = "0"
 pz = log_parser.LogParserEngine(zero_cfg)
 pz.discover_log_files = lambda *a, **k: []
 pz.discover_auth_logs = lambda *a, **k: []
-pz.window.add("185.199.112.7", "hits", 500, now_e)
+for slot_z in (now_e, now_e - 200):
+    pz.window.add("185.199.112.7", "hits", 500, slot_z)
 ez = apply_engine.ApplyEngine(zero_cfg)
 ez.audit.parser = pz
 pz.cdn_check = ez.guard.is_cdn_edge_ip
@@ -661,31 +683,39 @@ os.makedirs(sub_state, exist_ok=True)
 sub_cfg = dict(cfg)
 sub_cfg["STATE_DIR"] = steady(sub_state)
 sub_cfg["SUBNET_MIN_IPS"] = "5"
-sub_cfg["THRESHOLD_SUBNET_HITS"] = "2000"
+sub_cfg["THRESHOLD_SUBNET_HITS_PER_INTERVAL"] = "2000"
 
 flood = log_parser.LogParserEngine(sub_cfg)
-# Must be "now": the sliding window prunes anything older than WINDOW_HOURS, and
-# a fixed epoch would silently age out before the subnet pass ever sees it.
+# Must be "now": buckets older than the strike window are pruned, and a fixed
+# epoch would silently age out before the subnet pass ever sees it.
 now_ts = int(time.time())
 # Isolate from whatever logs happen to exist on the machine running the suite.
 flood.discover_log_files = lambda *a, **k: []
 flood.discover_auth_logs = lambda *a, **k: []
 # 2 networks x 250 hosts x 45 hits = 22,500 hits per network
-for third in (7, 8):
-    for host in range(1, 251):
-        for _ in range(45):
-            flood.window.add(f"185.199.{third}.{host}", "hits", 1, now_ts)
+# Across two intervals: a range is judged by the same strike rule an address
+# is, because a CGNAT block genuinely does light up for one interval when
+# several of its users load a page at the same moment.
+for slot_f in (now_ts, now_ts - 200):
+    for third in (7, 8):
+        for host in range(1, 251):
+            for _ in range(45):
+                flood.window.add(f"185.199.{third}.{host}", "hits", 1, slot_f)
 # one lone heavy host in an unrelated /24 — must NOT drag its neighbours in
-for _ in range(9000):
-    flood.window.add("185.199.9.99", "hits", 1, now_ts)
+for slot_l in (now_ts, now_ts - 200):
+    for _ in range(9000):
+        flood.window.add("185.199.9.99", "hits", 1, slot_l)
 
 rollup = flood.window.subnet_rollup(24, 64)
 check("subnet: rollup groups hosts into their /24",
       rollup.get("185.199.7.0/24", {}).get("members") == 250,
       rollup.get("185.199.7.0/24", {}).get("members"))
-check("subnet: rollup sums the whole network's hits",
-      rollup["185.199.7.0/24"]["hits"] == 250 * 45,
+check("subnet: rollup sums the whole network's hits over the window",
+      rollup["185.199.7.0/24"]["hits"] == 250 * 45 * 2,
       rollup["185.199.7.0/24"]["hits"])
+check("subnet: rollup also reports the single-interval peak",
+      rollup["185.199.7.0/24"]["peak_hits"] == 250 * 45,
+      rollup["185.199.7.0/24"]["peak_hits"])
 
 sub_engine = apply_engine.ApplyEngine(sub_cfg)
 sub_engine.audit.parser = flood
@@ -722,8 +752,8 @@ for host in range(6):
 check("v6 /64: six rotating addresses collapse to ONE counter",
       len(rot.window.entries) == 1, list(rot.window.entries)[:3])
 check("v6 /64: the counter holds every request the visitor made",
-      rot.window.entries.get("2001:db8:abcd:1234::/64", {}).get("hits") == 1200,
-      rot.window.entries.get("2001:db8:abcd:1234::/64", {}).get("hits"))
+      rot.window.intent_sum("hits").get("2001:db8:abcd:1234::/64") == 1200,
+      rot.window.intent_sum("hits").get("2001:db8:abcd:1234::/64"))
 
 # The escape hatch has to work, or a host with unusual v6 allocation is stuck.
 per_state = os.path.join(work, "per_state")
@@ -740,19 +770,33 @@ check("v6 /64: IPV6_BLOCK_PREFIX=128 restores per-address counting",
 # /64 — and neither necessarily crosses a threshold the total would have.
 mig_state = os.path.join(work, "mig_state")
 os.makedirs(mig_state, exist_ok=True)
+SLOT = now_ts // 120
 with open(os.path.join(mig_state, "window.json"), "w", encoding="utf-8") as fh:
-    json.dump({"ips": {
-        "2001:db8:aaaa:1::5":  {"hits": 300, "first": now_ts, "last": now_ts},
-        "2001:db8:aaaa:1::99": {"hits": 250, "first": now_ts, "last": now_ts},
-        "185.199.108.10":      {"hits": 10,  "first": now_ts, "last": now_ts},
+    json.dump({"format": "buckets", "interval": 120, "ips": {
+        "2001:db8:aaaa:1::5":  {str(SLOT): {"hits": 300}},
+        "2001:db8:aaaa:1::99": {str(SLOT): {"hits": 250}},
+        "185.199.108.10":      {str(SLOT): {"hits": 10}},
     }}, fh)
 mig_cfg = dict(cfg); mig_cfg["STATE_DIR"] = steady(mig_state)
 mig = log_parser.LogParserEngine(mig_cfg)
-check("v6 /64: an old state file folds its bare keys into the /64 on load",
-      mig.window.entries.get("2001:db8:aaaa:1::/64", {}).get("hits") == 550,
+check("v6 /64: a state file folds its bare keys into the /64 on load",
+      mig.window.intent_sum("hits").get("2001:db8:aaaa:1::/64") == 550,
       dict(mig.window.entries))
+
+# A pre-bucket state file holds one running total per address covering an
+# unknown span. There is no honest bucket to put it in, so it is dropped rather
+# than guessed at — the cost is one window of history, once.
+legacy_state = os.path.join(work, "legacy_state")
+os.makedirs(legacy_state, exist_ok=True)
+with open(os.path.join(legacy_state, "window.json"), "w", encoding="utf-8") as fh:
+    json.dump({"ips": {"185.199.108.10": {"hits": 99999, "first": 1, "last": now_ts}}}, fh)
+legacy_cfg = dict(cfg); legacy_cfg["STATE_DIR"] = steady(legacy_state)
+legacy = log_parser.LogParserEngine(legacy_cfg)
+check("state: a pre-bucket window file is discarded, not misread",
+      legacy.window.entries == {} and legacy.window.dropped_legacy == 1,
+      (len(legacy.window.entries), legacy.window.dropped_legacy))
 check("v6 /64: folding leaves IPv4 keys untouched",
-      mig.window.entries.get("185.199.108.10", {}).get("hits") == 10,
+      mig.window.intent_sum("hits").get("185.199.108.10") == 10,
       list(mig.window.entries))
 
 # ---- second-tier IPv6 rollup: one address per /64 ---------------------------
@@ -771,9 +815,10 @@ v6_cfg["STATE_DIR"] = steady(v6_state)
 v6 = log_parser.LogParserEngine(v6_cfg)
 v6.discover_log_files = lambda *a, **k: []
 v6.discover_auth_logs = lambda *a, **k: []
-for block in range(20):
-    for _ in range(300):
-        v6.window.add("2a03:2880:f800:%x::" % block, "hits", 1, now_ts)
+for slot_v6 in (now_ts, now_ts - 200):
+    for block in range(20):
+        for _ in range(300):
+            v6.window.add("2a03:2880:f800:%x::" % block, "hits", 1, slot_v6)
 
 r64 = v6.window.subnet_rollup(24, 64)
 r56 = v6.window.subnet_rollup(24, 56)
@@ -806,9 +851,10 @@ few_cfg = dict(v6_cfg); few_cfg["STATE_DIR"] = steady(few_state)
 few = log_parser.LogParserEngine(few_cfg)
 few.discover_log_files = lambda *a, **k: []
 few.discover_auth_logs = lambda *a, **k: []
-for block in range(3):
-    for _ in range(3000):
-        few.window.add("2a03:2880:f900:%x::" % block, "hits", 1, now_ts)
+for slot_few in (now_ts, now_ts - 200):
+    for block in range(3):
+        for _ in range(3000):
+            few.window.add("2a03:2880:f900:%x::" % block, "hits", 1, slot_few)
 few_engine = apply_engine.ApplyEngine(few_cfg)
 few_engine.audit.parser = few
 few_engine.audit.parser.cdn_check = few_engine.guard.is_cdn_edge_ip
@@ -978,8 +1024,15 @@ check("naming: generic set name never appears in the emitted script",
 # Six detections added after the 16 Aug audit of the verdict path. Each one is
 # exercised on counters built directly, so no fixture or web server is involved.
 
-def verdict_for(name, counters, overrides=None):
-    """Runs one address' counters through the real audit path."""
+def verdict_for(name, counters, overrides=None, slots=1):
+    """
+    Runs one address' counters through the real audit path.
+
+    `slots` is how many separate intervals the counters are repeated across.
+    Intent rules want 1 — their thresholds are exact sums. Volume rules want 2
+    or more, because a single loud interval is a visitor by construction and no
+    volume verdict exists below STRIKES_REQUIRED.
+    """
     sig_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
                    CLIENT_PROFILING="0")
     sig_cfg.update(overrides or {})
@@ -987,10 +1040,12 @@ def verdict_for(name, counters, overrides=None):
     pe = log_parser.LogParserEngine(sig_cfg)
     pe.discover_log_files = lambda *a, **k: []
     pe.discover_auth_logs = lambda *a, **k: []
-    stamp = int(time.time())
-    for ip, metrics in counters.items():
-        for metric, value in metrics.items():
-            pe.window.add(ip, metric, value, stamp)
+    base = int(time.time())
+    for offset in range(slots):
+        stamp = base - offset * 200
+        for ip, metrics in counters.items():
+            for metric, value in metrics.items():
+                pe.window.add(ip, metric, value, stamp)
     ae = apply_engine.ApplyEngine(sig_cfg)
     ae.audit.parser = pe
     pe.cdn_check = ae.guard.is_cdn_edge_ip
@@ -1031,12 +1086,12 @@ check("attack ua: permanent",
       v.get("45.10.20.10", {}).get("tier") == "PERMANENT")
 
 # --- N2 PathBruteForce -------------------------------------------------------
-v = verdict_for("scan404", {"45.10.30.10": {"hits": 60, "p404": 50}})
+v = verdict_for("scan404", {"45.10.30.10": {"hits": 60, "p404": 50}}, slots=2)
 check("404: a scanner whose requests are mostly 404 is caught",
       "PathBruteForce" in v.get("45.10.30.10", {}).get("reason", ""), sorted(v))
 # The ratio guard is what stops a site with a broken theme from convicting its
 # own visitors: same 50 not-founds, but a small share of real traffic.
-v = verdict_for("scan404_ratio", {"45.10.30.11": {"hits": 500, "p404": 50}})
+v = verdict_for("scan404_ratio", {"45.10.30.11": {"hits": 500, "p404": 50}}, slots=2)
 check("404: same count but a low share is NOT a path brute force",
       "PathBruteForce" not in v.get("45.10.30.11", {}).get("reason", ""),
       v.get("45.10.30.11"))
@@ -1071,7 +1126,7 @@ wide_bw = {}
 for n in range(10):
     wide_bw["2a03:2880:f800:%x::/64" % n] = {"hits": 20, "bw": 40 * 1024 * 1024}
 v = verdict_for("v6bw", wide_bw, {"SUBNET6_WIDE_DETECTION": "1",
-                                  "SUBNET_DETECTION": "1"})
+                                  "SUBNET_DETECTION": "1"}, slots=2)
 wide_hit = [k for k in v if k.endswith("::/56")]
 check("v6 wide bw: a /56 draining bandwidth is caught at all",
       bool(wide_hit), sorted(v))
@@ -1105,16 +1160,20 @@ def catchup_log(name, span_seconds, seed_last_run=None, guard="1"):
             json.dump({"last_run": seed_last_run}, f)
     cu_cfg["STATE_DIR"] = cu_state
 
+    # One clearly-over-threshold burst per interval, in as many intervals as the
+    # span covers. A volume verdict needs STRIKES_REQUIRED of them, so a fixture
+    # that writes everything into one instant would test nothing.
     path = os.path.join(work, "cu_" + name + ".log")
-    rows = 20
-    step = span_seconds // max(rows - 1, 1)
+    slots = max(2, span_seconds // 120)
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(rows):
-            when = stamp_now(-(span_seconds - i * step) - 60)
-            f.write('%s - - [%s] "GET /index.html HTTP/1.1" 200 100 "-" "curl/8"\n'
-                    % (VOLUME_IP, when))
-            f.write('%s - - [%s] "POST /wp-login.php HTTP/1.1" 401 100 "-" "curl/8"\n'
-                    % (INTENT_IP, when))
+        for slot in range(slots):
+            when = stamp_now(-(60 + slot * 120))
+            for _ in range(25):
+                f.write('%s - - [%s] "GET /index.html HTTP/1.1" 200 100 "-" "curl/8"\n'
+                        % (VOLUME_IP, when))
+            for _ in range(4):
+                f.write('%s - - [%s] "POST /wp-login.php HTTP/1.1" 401 100 "-" "curl/8"\n'
+                        % (INTENT_IP, when))
 
     pe = log_parser.LogParserEngine(cu_cfg)
     pe.discover_log_files = lambda *a, **k: [path]
@@ -1154,12 +1213,10 @@ check("catchup: so volume detection keeps working after a reboot",
       VOLUME_IP in v, sorted(v))
 
 # --- measurement recorded for the operator
-# 20 rows across 120 seconds land on a 6-second grid, so the measured span is
-# 19 steps rather than a round 120 — the point is that it is MEASURED.
 check("catchup: the measured span is exposed",
-      110 <= pe.span_end - pe.span_start <= 120, pe.span_end - pe.span_start)
+      pe.span_end - pe.span_start == 120, pe.span_end - pe.span_start)
 check("catchup: every line contributed a usable stamp",
-      pe.stamped == 40 and pe.unstamped == 0, (pe.stamped, pe.unstamped))
+      pe.stamped == 58 and pe.unstamped == 0, (pe.stamped, pe.unstamped))
 
 # --- guard disabled
 v, pe = catchup_log("off", 3 * 3600, seed_last_run=now_i - 60, guard="0")
@@ -1190,6 +1247,114 @@ check("catchup: unreadable stamps fall back to the run gap", fb_pe.catchup,
 check("catchup: those lines still counted, using the run clock",
       fb_pe.unstamped == 20 and fb_pe.stamped == 0,
       (fb_pe.stamped, fb_pe.unstamped))
+
+
+# ======================================= two classes of signal, two windows ===
+#
+# Measured on a production host and turned into a regression, because getting
+# this wrong in either direction is a silent failure rather than a loud one.
+
+# --- the slow brute force, which per-interval counting would have missed ------
+#
+# Four addresses on that host were knocking on wp-login.php exactly TWICE per
+# two-minute interval, sustained: 194, 84, 58 and 52 attempts spread over 97,
+# 43, 29 and 26 intervals. Every one of them sits below THRESHOLD_WP_LOGIN=5, so
+# a per-interval threshold catches none. The intent window sums instead.
+slow_state = os.path.join(work, "slow_state")
+slow_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
+                CLIENT_PROFILING="0", THRESHOLD_WP_LOGIN="5",
+                INTENT_WINDOW_MIN="30", EVAL_INTERVAL_SEC="120")
+slow_cfg["STATE_DIR"] = steady(slow_state)
+slow = log_parser.LogParserEngine(slow_cfg)
+slow.discover_log_files = lambda *a, **k: []
+slow.discover_auth_logs = lambda *a, **k: []
+now_s = int(time.time())
+SLOW = "91.92.242.191"
+for slot in range(10):                    # 10 intervals x 2 attempts = 20
+    slow.window.add(SLOW, "wp", 2, now_s - slot * 120)
+    slow.window.add(SLOW, "hits", 2, now_s - slot * 120)
+
+check("slow brute: never more than 2 attempts in any one interval",
+      max(m.get("wp", 0) for m in slow.window.entries[SLOW].values()) == 2,
+      max(m.get("wp", 0) for m in slow.window.entries[SLOW].values()))
+check("slow brute: a per-interval threshold of 5 would see nothing",
+      slow.window.strikes("wp", 5) == {}, slow.window.strikes("wp", 5))
+
+slow_ae = apply_engine.ApplyEngine(slow_cfg)
+slow_ae.audit.parser = slow
+slow.cdn_check = slow_ae.guard.is_cdn_edge_ip
+slow_v = slow_ae.audit.evaluate_candidates()
+check("slow brute: the intent window catches it anyway", SLOW in slow_v, sorted(slow_v))
+check("slow brute: named as the brute force it is",
+      "BruteForce" in slow_v.get(SLOW, {}).get("reason", ""), slow_v.get(SLOW))
+check("slow brute: permanent, like every intent verdict",
+      slow_v.get(SLOW, {}).get("tier") == "PERMANENT", slow_v.get(SLOW))
+
+# --- the loud visitor, which cumulative counting used to convict --------------
+#
+# On that same host the largest single-interval bursts belonged to ordinary
+# people: 134, 88 and 67 requests, each in ONE interval and silent afterwards.
+# One modern page view is 30-80 requests, so this is somebody opening a couple
+# of pages. It must never become a block, however loud that one interval was.
+burst_state = os.path.join(work, "burst_state")
+burst_cfg = dict(cfg, SUBNET_DETECTION="0", SUBNET6_WIDE_DETECTION="0",
+                 CLIENT_PROFILING="0", THRESHOLD_HITS_PER_INTERVAL="60",
+                 STRIKES_REQUIRED="2")
+burst_cfg["STATE_DIR"] = steady(burst_state)
+burst = log_parser.LogParserEngine(burst_cfg)
+burst.discover_log_files = lambda *a, **k: []
+burst.discover_auth_logs = lambda *a, **k: []
+VISITOR = "114.10.11.58"
+CRAWLER = "216.73.216.188"
+burst.window.add(VISITOR, "hits", 134, now_s)          # one loud interval
+for slot in range(8):                                  # loud for hours
+    burst.window.add(CRAWLER, "hits", 474, now_s - slot * 120)
+
+burst_ae = apply_engine.ApplyEngine(burst_cfg)
+burst_ae.audit.parser = burst
+burst.cdn_check = burst_ae.guard.is_cdn_edge_ip
+burst_v = burst_ae.audit.evaluate_candidates()
+check("loud visitor: 134 requests in ONE interval is not a block",
+      VISITOR not in burst_v, sorted(burst_v))
+check("loud visitor: the same rule still catches the sustained crawler",
+      CRAWLER in burst_v, sorted(burst_v))
+check("loud visitor: the reason states both the peak and the repetition",
+      "in one interval" in burst_v.get(CRAWLER, {}).get("reason", "")
+      and "intervals over" in burst_v.get(CRAWLER, {}).get("reason", ""),
+      burst_v.get(CRAWLER, {}).get("reason"))
+
+# --- counters must actually decay --------------------------------------------
+#
+# The bug this release exists to kill: a counter that only reset after a full
+# day of silence, so an address seen once a day accumulated forever and a loyal
+# visitor eventually reached a volume threshold having done nothing.
+decay_state = os.path.join(work, "decay_state")
+decay_cfg = dict(cfg, EVAL_INTERVAL_SEC="120", STRIKES_WINDOW="10",
+                 INTENT_WINDOW_MIN="30")
+decay_cfg["STATE_DIR"] = steady(decay_state)
+decay = log_parser.LogParserEngine(decay_cfg)
+LOYAL = "203.0.113.77"
+for day in range(30):                     # a daily visitor, 30 days running
+    decay.window.add(LOYAL, "hits", 20, now_s - day * 86400)
+decay.window.prune(now_s)
+check("decay: a month of daily visits leaves only the recent window",
+      decay.window.intent_sum("hits").get(LOYAL, 0) == 20,
+      decay.window.intent_sum("hits").get(LOYAL, 0))
+check("decay: and the stale buckets are gone from the state file",
+      len(decay.window.entries.get(LOYAL, {})) == 1,
+      len(decay.window.entries.get(LOYAL, {})))
+
+# --- the renamed settings must be refused loudly, never reinterpreted ---------
+stale_cfg = dict(cfg)
+stale_cfg["THRESHOLD_HITS"] = "400"
+stale_ae = apply_engine.ApplyEngine(stale_cfg)
+warning = stale_ae.audit._renamed_setting_warning()
+check("rename: an old threshold name is reported, not silently obeyed",
+      warning is not None and "THRESHOLD_HITS" in warning, warning)
+check("rename: the message says the value is ignored",
+      warning is not None and "IGNORED" in warning, warning)
+check("rename: a clean config produces no warning",
+      apply_engine.ApplyEngine(dict(cfg)).audit._renamed_setting_warning() is None)
 
 
 print()

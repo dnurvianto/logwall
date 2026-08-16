@@ -562,7 +562,7 @@ protected.
 ### G. Log Formats Across Web Servers (not just different paths — different structures)
 
 The claim of working "across web servers" does not end at log paths. What breaks a parser is the
-differing **format** and **byte field name**. Without this normalisation layer, `THRESHOLD_BW_MB`
+differing **format** and **byte field name**. Without this normalisation layer, `THRESHOLD_BW_MB_PER_INTERVAL`
 miscounts on Apache and the parser dies outright on Caddy.
 
 | Web server | Default format | Bytes-sent field | Parser notes |
@@ -605,7 +605,7 @@ request.remote_ip / request.client_ip  → source address (client_ip already res
 request.headers.Cf-Connecting-Ip[0]    → the real address behind Cloudflare (§8.F)
 request.uri                            → wp-login / xmlrpc / .env / .git detection
 status                                 → 401/403 panel brute-force detection
-size                                   → bandwidth accumulation (THRESHOLD_BW_MB)
+size                                   → bandwidth per interval (THRESHOLD_BW_MB_PER_INTERVAL)
 request.headers.User-Agent[0]          → bot control (§11)
 ```
 A corrupt or truncated JSON line (the log was mid-write when it was read) → **skip that line
@@ -750,8 +750,10 @@ BLACKLIST=/etc/logwall/blacklist_ips.txt
 SKIP_LIST=/etc/logwall/bypass_rules.txt
 THRESHOLD_WP_LOGIN=5          # wp-login.php attempts
 THRESHOLD_XMLRPC=2            # xmlrpc.php attempts
-THRESHOLD_HITS=40             # total requests / 24 hours
-THRESHOLD_BW_MB=30            # bandwidth per address (MB)
+THRESHOLD_HITS_PER_INTERVAL=60    # requests from one address inside one interval
+THRESHOLD_BW_MB_PER_INTERVAL=20   # bandwidth from one address inside one interval
+STRIKES_REQUIRED=2                # intervals over the line before a volume block
+STRIKES_WINDOW=10                 # ...counted among the last this many intervals
 THRESHOLD_SENSITIVE_SCAN=2    # access to .env/.sql/.bak/phpmyadmin/.git
 THRESHOLD_PANEL_401=5         # failed panel logins (401/403)
 THRESHOLD_PANEL_HITS=200      # panel hits
@@ -788,7 +790,8 @@ CDN_NO_REALIP_POLICY=audit_only   # a log without a real IP → that site is aud
 # ===== Execution Reliability (§16) =====
 LOCK_FILE=/var/lock/logwall.lock
 LOCK_STALE_MIN=30                 # a lock older than this is treated as a crash → cleaned + WARN
-WINDOW_HOURS=24                   # threshold counting window (from state, not by re-scanning logs)
+INTENT_WINDOW_MIN=30              # how far back the INTENT counters sum
+EVAL_INTERVAL_SEC=120             # interval width; keep equal to BLOCKER_SCHEDULE
 WEBSERVER=auto                    # auto | nginx | apache | litespeed | caddy (§8.G)
 LOG_FORMAT=auto                   # auto | combined | json | custom (pair with LOG_REGEX)
 APACHE_BYTES_FIELD=auto           # auto | b | O — %O includes headers and must be normalised
@@ -959,8 +962,11 @@ below close that gap.
      bytes.
    - The inode changed **or** `size < offset` → a rotation happened → read whatever remains
      unread in the old file (`.1`, `.1.gz`), then start from offset 0 on the new one.
-   - Per-address counters live in `window.json` with a `WINDOW_HOURS` TTL, rather than being
-     recomputed from zero every cycle.
+   - Per-address counters live in `window.json` as **per-interval buckets**, rather than being
+     recomputed from zero every cycle or accumulated into one running total. Buckets fall off
+     the back by time, so nothing grows without bound. Before 1.0.0-rc12 a counter reset only
+     after a full day of complete silence, which meant an address seen once a day accumulated
+     forever and a loyal visitor could reach a volume threshold having done nothing.
    - `LOG_MAX_MB_PER_RUN` caps a surge (after the tool has been dead for a week, say) so that a
      single cycle cannot exhaust the server's RAM or CPU.
 

@@ -3,9 +3,9 @@
 # Project: logwall — Cross-Distro & Cross-Panel Server Firewall Automation
 # Module: lib/py/log_parser.py
 # Purpose: Access log parser for Nginx/Apache combined, LiteSpeed, and Caddy JSON.
-#          Reads only new bytes per run (inode + offset cursor) and accumulates
-#          the counters in a persistent sliding window, so thresholds keep meaning
-#          "per WINDOW_HOURS" even though the blocker runs every few minutes.
+#          Reads only new bytes per run (inode + offset cursor) and files each
+#          request into a per-interval bucket, so volume rules can be judged one
+#          interval at a time while intent rules sum over a short sliding window.
 #
 # Memory: parsing streams. Entries are yielded one at a time and the raw line is
 #         never retained, so peak memory stays flat no matter how large the
@@ -199,70 +199,124 @@ IP_TOKEN_RE = re.compile(
 
 
 class TrafficWindow:
-    """Persistent per-IP counters with a time-to-live of WINDOW_HOURS."""
+    """
+    Per-address counters kept in per-interval buckets, not as one running total.
 
-    def __init__(self, state_dir, window_hours=24, max_ips=200000, v6_prefix=64):
+    The previous shape was a single number per address with a 24-hour idle TTL.
+    That number never went down: prune() dropped an entry whole once it had been
+    silent for a full day, so any address that appeared even once a day
+    accumulated for as long as it kept visiting. A loyal low-rate visitor would
+    eventually reach a volume threshold having done nothing wrong, and the
+    thresholds documented as "per WINDOW_HOURS" actually meant "since first
+    continuous activity".
+
+    Buckets fix that, and they also make the two classes of signal answerable
+    with one structure, because measurement showed the classes want opposite
+    things (measured on a production host, 911,795 lines, 1,703 addresses):
+
+      VOLUME (hits, bandwidth, 404s, login POSTs)
+        Normal visitors are LOUD here — one modern page view is 30-80 requests,
+        so p90 of the peak-per-interval was 6 but the tail reached 134 for people
+        who simply opened three pages. A single interval cannot tell them from an
+        attacker. What separates them is persistence: the visitor is loud once,
+        the crawler is loud for hours. So volume is judged per interval and an
+        address must be over the line in STRIKES_REQUIRED separate intervals.
+        Measured: threshold 60 with one interval flagged 6 innocents; the same
+        threshold requiring 2 intervals flagged none.
+
+      INTENT (wp-login, xmlrpc, recon, 401/403, failed logins, scanner UA)
+        Normal visitors are SILENT here — the base rate is zero, nobody browses
+        to wp-login.php five times by accident. And attackers deliberately go
+        slow: four addresses on that host were knocking on wp-login.php exactly
+        TWICE per two-minute interval, sustained across 97 intervals. A
+        per-interval threshold of 5 would have missed every one of them. So
+        intent is summed across a short sliding window instead.
+
+    Both windows genuinely slide: buckets fall off the back by time, so no
+    counter grows without bound.
+    """
+
+    def __init__(self, state_dir, interval=120, strikes_window=10,
+                 intent_minutes=30, max_ips=200000, v6_prefix=64):
         self.v6_prefix = v6_prefix
         self.path = os.path.join(state_dir, "window.json")
         self.state_dir = state_dir
-        self.window_seconds = max(1, window_hours) * 3600
+        self.interval = max(1, interval)
+        self.strikes_window = max(1, strikes_window)
+        self.intent_buckets = max(1, (intent_minutes * 60) // self.interval)
+        self.keep_buckets = max(self.strikes_window, self.intent_buckets)
         self.max_ips = max_ips
         self.entries = {}
+        self.dropped_legacy = 0
         self.load()
 
+    # ------------------------------------------------------------------ state
     def load(self):
-        if os.path.isfile(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    self.entries = data.get("ips", {})
-                    self._migrate_v6_keys()
-            except (OSError, ValueError):
-                self.entries = {}
+        if not os.path.isfile(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+
+        ips = data.get("ips", {})
+        if not isinstance(ips, dict):
+            return
+
+        # A state file from before bucketing holds one running total per address.
+        # Those totals cover an unknown and unbounded span, so there is no honest
+        # way to place them in a bucket. They are dropped rather than guessed at,
+        # which costs one window of history exactly once.
+        if data.get("format") != "buckets":
+            self.dropped_legacy = len(ips)
+            return
+
+        for ip, buckets in ips.items():
+            if not isinstance(buckets, dict):
+                continue
+            clean = {}
+            for key, metrics in buckets.items():
+                if not isinstance(metrics, dict):
+                    continue
+                index = _safe_int(key, -1)
+                if index >= 0:
+                    clean[index] = {m: _safe_int(v) for m, v in metrics.items()
+                                    if m in METRIC_KEYS}
+            if clean:
+                self.entries[ip] = clean
+
+        self._migrate_v6_keys()
+
+    def save(self):
+        payload = {
+            "updated": int(time.time()),
+            "format": "buckets",
+            "interval": self.interval,
+            "ips": {ip: {str(index): metrics for index, metrics in buckets.items()}
+                    for ip, buckets in self.entries.items()},
+        }
+        _atomic_write_json(self.path, payload)
 
     def _migrate_v6_keys(self):
-        """
-        Folds pre-existing per-address IPv6 counters into their /64.
-
-        Without this, a state file written before IPV6_BLOCK_PREFIX took effect
-        keeps its bare-address keys for a full window while new traffic lands
-        under the /64 — one source counted twice, and neither key necessarily
-        crossing a threshold the combined total would have crossed. Observed on
-        a live host mid-deploy: 174 old keys beside 44 new ones, and a range
-        reason that read "114 /64s" for 70 actual networks.
-        """
+        """Folds bare IPv6 addresses into the /64 the rest of the code counts by."""
         if self.v6_prefix >= 128:
             return
-        merged = {}
-        for key, entry in self.entries.items():
-            new_key = self._collapse_v6(key)
-            existing = merged.get(new_key)
-            if existing is None:
-                merged[new_key] = entry
+        for ip in list(self.entries):
+            if ":" not in ip or "/" in ip:
                 continue
-            for metric in METRIC_KEYS:
-                existing[metric] = existing.get(metric, 0) + entry.get(metric, 0)
-            existing["first"] = min(existing.get("first", 0), entry.get("first", 0))
-            existing["last"] = max(existing.get("last", 0), entry.get("last", 0))
-        self.entries = merged
+            folded = self._collapse_v6(ip)
+            if folded == ip:
+                continue
+            target = self.entries.setdefault(folded, {})
+            for index, metrics in self.entries.pop(ip).items():
+                bucket = target.setdefault(index, {})
+                for metric, value in metrics.items():
+                    bucket[metric] = bucket.get(metric, 0) + value
 
     def _collapse_v6(self, ip_str):
-        """
-        Counts IPv6 per /64 — the block a customer is actually handed.
-
-        A residential or mobile client owns an entire /64 and rotates addresses
-        inside it freely; privacy extensions do so every few hours by default.
-        Counting per /128 therefore splits one visitor across many keys: measured
-        on a synthetic rotation of six addresses at 200 hits each, no single key
-        reached the 400-hit threshold while the source had made 1,200 requests.
-        The /24 equivalent for IPv4 does not exist here — a /64 IS the address.
-
-        Blocking follows counting, which is the point: a /128 entry is obsolete
-        the moment the client rotates, while the /64 holds.
-
-        `IPV6_BLOCK_PREFIX=128` restores per-address behaviour.
-        """
         if ":" not in ip_str or "/" in ip_str or self.v6_prefix >= 128:
             return ip_str
         try:
@@ -271,51 +325,96 @@ class TrafficWindow:
         except ValueError:
             return ip_str
 
-    def add(self, ip, metric, value, now):
+    # ------------------------------------------------------------- collection
+    def add(self, ip, metric, value, stamp):
         ip = self._collapse_v6(ip)
-        entry = self.entries.get(ip)
-        if entry is None:
-            entry = {key: 0 for key in METRIC_KEYS}
-            entry["first"] = now
-            self.entries[ip] = entry
-        entry[metric] = entry.get(metric, 0) + value
-        entry["last"] = now
+        index = stamp // self.interval
+        bucket = self.entries.setdefault(ip, {}).setdefault(index, {})
+        bucket[metric] = bucket.get(metric, 0) + value
 
     def prune(self, now):
-        cutoff = now - self.window_seconds
-        self.entries = {
-            ip: entry for ip, entry in self.entries.items()
-            if entry.get("last", 0) >= cutoff
-        }
+        oldest = (now // self.interval) - self.keep_buckets
+        for ip in list(self.entries):
+            buckets = {index: metrics for index, metrics in self.entries[ip].items()
+                       if index > oldest}
+            if buckets:
+                self.entries[ip] = buckets
+            else:
+                del self.entries[ip]
 
         # Hard cap so a flood of unique addresses cannot grow the state file
         # without bound. The busiest offenders are the ones worth remembering.
         if len(self.entries) > self.max_ips:
             ranked = sorted(self.entries.items(),
-                            key=lambda kv: kv[1].get("hits", 0),
+                            key=lambda kv: sum(b.get("hits", 0) for b in kv[1].values()),
                             reverse=True)
             self.entries = dict(ranked[:self.max_ips])
 
-    def counter(self, metric):
-        return {ip: entry.get(metric, 0) for ip, entry in self.entries.items()}
+    # ------------------------------------------------------------- inspection
+    def _recent(self, buckets, count):
+        if not buckets:
+            return []
+        newest = max(buckets)
+        floor = newest - count
+        return [metrics for index, metrics in buckets.items() if index > floor]
 
+    def intent_sum(self, metric):
+        """Total over the intent window. For signals whose base rate is zero."""
+        out = {}
+        for ip, buckets in self.entries.items():
+            total = sum(m.get(metric, 0)
+                        for m in self._recent(buckets, self.intent_buckets))
+            if total:
+                out[ip] = total
+        return out
+
+    def strikes(self, metric, threshold):
+        """
+        How many separate intervals this address was over the line.
+
+        This is the whole reason a real visitor's burst does not become a block:
+        opening three pages is loud in ONE interval and silent in the next.
+        """
+        out = {}
+        if threshold <= 0:
+            return out
+        for ip, buckets in self.entries.items():
+            count = sum(1 for m in self._recent(buckets, self.strikes_window)
+                        if m.get(metric, 0) > threshold)
+            if count:
+                out[ip] = count
+        return out
+
+    def peak(self, metric):
+        """Largest single-interval value, used to state the evidence in a reason."""
+        out = {}
+        for ip, buckets in self.entries.items():
+            values = [m.get(metric, 0)
+                      for m in self._recent(buckets, self.strikes_window)]
+            top = max(values) if values else 0
+            if top:
+                out[ip] = top
+        return out
+
+    def get(self, ip, metric):
+        buckets = self.entries.get(ip, {})
+        return sum(m.get(metric, 0) for m in self._recent(buckets, self.intent_buckets))
+
+    # ------------------------------------------------------------------ nets
     def subnet_rollup(self, prefix_v4=24, prefix_v6=64):
         """
-        Sums every per-address counter into its containing network.
+        Sums every per-address bucket into its containing network, keeping the
+        buckets intact so a range is judged by the same rules an address is.
 
         A flood spread across hundreds of addresses inside one or two /24s is a
-        single coordinated source, not hundreds of weak ones. Counting only per
-        address means each member creeps toward the threshold separately and the
-        block lands far too late — or not at all, because no single member ever
-        looks like more than an ordinary visitor.
-
-        `members` is the number of distinct addresses seen in the network. The
-        caller uses it to require evidence of coordination before ever proposing
-        a range: one busy address must never drag its 255 neighbours down.
+        single coordinated source, not hundreds of weak ones. `members` is the
+        number of distinct addresses seen; the caller requires evidence of
+        coordination before ever proposing a range, so one busy visitor cannot
+        drag 255 neighbours down.
         """
         rollup = {}
 
-        for ip_str, entry in self.entries.items():
+        for ip_str, buckets in self.entries.items():
             # Fast path for the common shapes; ip_network() on every one of up to
             # WINDOW_MAX_IPS entries would dominate the run.
             if prefix_v4 == 24 and "." in ip_str and ":" not in ip_str:
@@ -338,21 +437,35 @@ class TrafficWindow:
 
             agg = rollup.get(key)
             if agg is None:
-                agg = {metric: 0 for metric in METRIC_KEYS}
-                agg["members"] = 0
+                agg = {"members": set(), "buckets": {}}
                 rollup[key] = agg
 
-            agg["members"] += 1
+            agg["members"].add(ip_str)
+            for index, metrics in buckets.items():
+                target = agg["buckets"].setdefault(index, {})
+                for metric, value in metrics.items():
+                    target[metric] = target.get(metric, 0) + value
+
+        out = {}
+        for key, agg in rollup.items():
+            buckets = agg["buckets"]
+            recent_strike = self._recent(buckets, self.strikes_window)
+            recent_intent = self._recent(buckets, self.intent_buckets)
+            entry = {"members": len(agg["members"])}
             for metric in METRIC_KEYS:
-                agg[metric] += entry.get(metric, 0)
+                values = [m.get(metric, 0) for m in recent_strike]
+                entry["peak_" + metric] = max(values) if values else 0
+                entry[metric] = sum(m.get(metric, 0) for m in recent_intent)
+            entry["_buckets"] = recent_strike
+            out[key] = entry
+        return out
 
-        return rollup
-
-    def get(self, ip, metric):
-        return self.entries.get(ip, {}).get(metric, 0)
-
-    def save(self):
-        _atomic_write_json(self.path, {"updated": int(time.time()), "ips": self.entries})
+    def net_strikes(self, entry, metric, threshold):
+        """Strike count for a rollup entry produced by subnet_rollup()."""
+        if threshold <= 0:
+            return 0
+        return sum(1 for m in entry.get("_buckets", [])
+                   if m.get(metric, 0) > threshold)
 
 
 def _atomic_write_json(path, payload):
@@ -392,9 +505,12 @@ class LogParserEngine:
         self.stamped = 0
         self.unstamped = 0
 
+        self.interval = max(1, get_int(self.config, "EVAL_INTERVAL_SEC", 120))
         self.window = TrafficWindow(
             self.state_dir,
-            window_hours=get_int(self.config, "WINDOW_HOURS", 24),
+            interval=self.interval,
+            strikes_window=get_int(self.config, "STRIKES_WINDOW", 10),
+            intent_minutes=get_int(self.config, "INTENT_WINDOW_MIN", 30),
             max_ips=get_int(self.config, "WINDOW_MAX_IPS", 200000),
             v6_prefix=get_int(self.config, "IPV6_BLOCK_PREFIX", 64),
         )
@@ -916,18 +1032,22 @@ class LogParserEngine:
 
         self.window.prune(now)
 
+        # Intent signals: summed over the intent window, because the base rate is
+        # zero and attackers deliberately trickle below any per-interval line.
+        # Volume signals: the engine asks for strikes and peaks itself, since
+        # both need the threshold to compute.
         return {
-            "hits": self.window.counter("hits"),
-            "wp_login": self.window.counter("wp"),
-            "xmlrpc": self.window.counter("xmlrpc"),
-            "scan": self.window.counter("scan"),
-            "bw": self.window.counter("bw"),
-            "panel_401": self.window.counter("p401"),
-            "auth_fail": self.window.counter("auth"),
-            "pages": self.window.counter("pages"),
-            "assets": self.window.counter("assets"),
-            "script_ua": self.window.counter("sua"),
-            "panel_404": self.window.counter("p404"),
-            "attack_ua": self.window.counter("aua"),
-            "login_post": self.window.counter("lpost"),
+            "wp_login": self.window.intent_sum("wp"),
+            "xmlrpc": self.window.intent_sum("xmlrpc"),
+            "scan": self.window.intent_sum("scan"),
+            "panel_401": self.window.intent_sum("p401"),
+            "auth_fail": self.window.intent_sum("auth"),
+            "attack_ua": self.window.intent_sum("aua"),
+            "pages": self.window.intent_sum("pages"),
+            "assets": self.window.intent_sum("assets"),
+            "script_ua": self.window.intent_sum("sua"),
+            "hits": self.window.intent_sum("hits"),
+            "bw": self.window.intent_sum("bw"),
+            "panel_404": self.window.intent_sum("p404"),
+            "login_post": self.window.intent_sum("lpost"),
         }

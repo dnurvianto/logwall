@@ -429,6 +429,8 @@ class ApplyEngine:
             print(f"{prefix}[LOG_NOT_FOUND] No access log discovered.", file=sys.stderr)
         if flags.get("CATCHUP_RUN"):
             print(f"{prefix}[CATCHUP_RUN] {flags['CATCHUP_RUN']}")
+        if flags.get("SETTING_RENAMED"):
+            print(f"{prefix}{flags['SETTING_RENAMED']}")
 
         print(f"{prefix}[SUMMARY] new={len(self.added)} expired={len(self.expired)} "
               f"escalated={len(self.escalated)} total={len(entries)}")

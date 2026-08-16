@@ -2,7 +2,101 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
-## Unreleased
+## 1.0.0-rc12 — 2026-08-16 (counters decay; two classes of signal, two windows)
+
+The counter never went down. `prune()` dropped an address whole once it had been
+silent for a full day, so anything seen even once a day accumulated for as long
+as it kept visiting. A loyal low-rate visitor would eventually reach a volume
+threshold having done nothing, and the thresholds documented as "per
+`WINDOW_HOURS`" actually meant "since first continuous activity".
+
+Fixing that meant deciding what a threshold counts over, and measurement said
+the answer is different for different signals — in opposite directions.
+
+### Volume is judged per interval, and must repeat
+
+Measured on a production host, 911,795 requests across 1,703 addresses: the
+peak-per-interval was 2 at the median and 6 at p90. But the tail belonged to
+ordinary people. The three largest single-interval bursts were 134, 88 and 67
+requests, each from a residential address that was silent in the next interval —
+one modern page view is 30-80 requests, so this is somebody opening a couple of
+pages.
+
+Inside a single interval that is indistinguishable from an attacker. What
+separates them is repetition: the visitor is loud once, the crawler is loud for
+hours.
+
+```
+threshold 60, 1 interval over the line   →  80 addresses,  6 of them innocent
+threshold 60, 2 intervals over the line  →  64 addresses,  0 innocent
+```
+
+Requiring two intervals removed every false positive and lost no genuine
+offender. `STRIKES_REQUIRED=2` over `STRIKES_WINDOW=10`.
+
+### Intent is summed over a short sliding window
+
+The opposite shape, because the traffic is the opposite shape. Nobody browses to
+`wp-login.php` five times by accident, so a real visitor's base rate is zero —
+and attackers exploit exactly that by going slow. On the same host:
+
+```
+91.92.242.191    2 attempts per interval, sustained across 97 intervals — 194 total
+91.92.243.236    2 per interval, 43 intervals — 84 total
+150.109.16.200   2 per interval, 29 intervals — 58 total
+2a02:c207:...    2 per interval, 26 intervals — 52 total
+```
+
+Four patient brute-forcers, every one of them parked just under
+`THRESHOLD_WP_LOGIN=5`. A per-interval threshold catches none of them. Intent
+counters therefore sum over `INTENT_WINDOW_MIN=30` minutes instead — and that
+window genuinely slides, because the counters live in per-interval buckets that
+fall off the back.
+
+Both classes are now regressions in the suite: the slow brute force must still
+be caught, and the 134-request visitor must still not be.
+
+### Settings were renamed rather than reinterpreted
+
+`THRESHOLD_HITS`, `THRESHOLD_BW_MB`, `THRESHOLD_404`, `THRESHOLD_SUBNET_HITS` and
+`THRESHOLD_SUBNET_BW_MB` counted per `WINDOW_HOURS`. The per-interval rules mean
+something else, so the names changed:
+
+| was | is | default |
+|---|---|---|
+| `THRESHOLD_HITS` | `THRESHOLD_HITS_PER_INTERVAL` | 60 |
+| `THRESHOLD_BW_MB` | `THRESHOLD_BW_MB_PER_INTERVAL` | 20 |
+| `THRESHOLD_404` | `THRESHOLD_404_PER_INTERVAL` | 30 |
+| `THRESHOLD_SUBNET_HITS` | `THRESHOLD_SUBNET_HITS_PER_INTERVAL` | 300 |
+| `THRESHOLD_SUBNET_BW_MB` | `THRESHOLD_SUBNET_BW_MB_PER_INTERVAL` | 60 |
+
+A leftover old name is reported on every run and its value ignored. This is the
+case that made it non-negotiable: a host running `THRESHOLD_HITS=400` for a day,
+read as a per-interval figure on that same host — whose busiest address peaked at
+474 — would have switched detection off almost entirely and said nothing about
+it. Preflight reports the same thing under `THRESHOLD_RENAMED`.
+
+### Ranges follow the same rule
+
+`/24`, `/64` and `/56` rollups are judged per interval with the same strike
+requirement, because a CGNAT or campus range genuinely does light up for one
+interval when several of its users load a page at the same moment. Measured
+across every range on that host: p99 of per-interval hits was 67, while the one
+coordinated crawler sat at 3,031. Default 300.
+
+### Bandwidth is a backstop, not a signal
+
+Measured per interval, the busiest address on a real site pulled 8.1 MB and p99
+was 1.04 MB. `THRESHOLD_BW_MB_PER_INTERVAL=20` is therefore inert on an ordinary
+site by design, and the config says so — it exists for a host serving large
+files, and needs raising there rather than lowering here.
+
+### State
+
+`window.json` now holds per-interval buckets. A file written by an earlier
+version holds one running total per address covering an unknown span, so there
+is no honest bucket to place it in: it is discarded on load rather than guessed
+at, which costs one window of history exactly once.
 
 ### Stop advising a package the host cannot install
 
@@ -36,6 +130,10 @@ chains detached and all four sets destroyed to reproduce what a reboot loses:
 
 Worst case is bounded by the cron interval, just under two minutes. The blocklist
 file itself is never at risk — the kernel set is only a copy of it.
+
+### Tests
+
+190 → 205 offline checks.
 
 ## 1.0.0-rc11 — 2026-08-16 (the blocking cap is gone; six detections added)
 

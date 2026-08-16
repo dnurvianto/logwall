@@ -55,7 +55,7 @@ only after you write the jails and get the log paths right yourself.
 |---|---|
 | **Detects** | Failed logins (SSH · IMAP/POP3 · SMTP AUTH · FTP · panel 401/403) · WordPress brute force · XML-RPC abuse · sensitive-file scanning (`.env`, `.git`, `.sql`, phpMyAdmin) · request floods · bandwidth abuse |
 | **Understands** | Nginx & Apache combined, LiteSpeed, Caddy JSON, and the one-placeholder variant panels emit. Log paths discovered automatically for 7 control panels |
-| **Measures** | A real 24-hour sliding window kept in persistent state — a 2-minute cron still measures a full day, not the last two minutes |
+| **Measures** | Per-interval buckets in persistent state. Volume is judged one interval at a time and must repeat before it blocks; intent is summed over a short sliding window, because attackers deliberately trickle below any single-interval line |
 | **Profiles** | Tells a real visitor from a script by whether the client fetches the stylesheets, scripts, fonts and images a browser pulls on its own — a signal a scraper cannot fake cheaply, because faking it means downloading the bandwidth it came to steal |
 | **Aggregates** | Counters roll up per /24 and per /64. A flood spread over hundreds of addresses inside one or two networks is caught as **one coordinated source**, minutes earlier, as a handful of range entries instead of hundreds of host entries |
 | **Protects** | Your whitelist (CIDR-aware) · dynamic DDNS hostnames · CDN edges · the server's own addresses · its default gateway · RFC1918 |
@@ -322,9 +322,21 @@ persistence; logwall only feeds it the addresses it detects.
 
 ### Tune before enforcing
 
-`THRESHOLD_HITS` ships at 40, which is deliberately conservative for a first look
-and **far too strict for a normal website** — one modern page view is 30-80
-requests. Raise it to 300-600 in `/etc/logwall.conf` before you enable enforcement.
+`THRESHOLD_HITS_PER_INTERVAL` ships at 60 requests inside one two-minute
+interval, and an address has to exceed that in `STRIKES_REQUIRED` separate
+intervals before anything is blocked.
+
+Those numbers are calibrated, not guessed: on a real site (911,795 requests,
+1,703 addresses) the median peak-per-interval was 2 and p90 was 6, while the
+sustained crawlers sat at 474. The gap between them is wide, which is why a
+single default fits most sites. The strike requirement is what makes it safe —
+one modern page view is 30-80 requests, so somebody opening three pages briefly
+looks exactly like an attacker, and on that site the largest bursts (134, 88,
+67) all belonged to ordinary people who were silent in the next interval.
+
+Run `logwall firewall audit` for a few cycles before enabling enforcement and
+read what it proposes. Raise the threshold if your pages are unusually heavy;
+raise `STRIKES_REQUIRED` if you would rather be slower and surer.
 
 ---
 

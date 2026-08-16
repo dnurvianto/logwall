@@ -47,6 +47,7 @@ class AuditEngine:
         metrics = self.parser.analyze_traffic(logs, auth_logs)
 
         candidates = {}
+        strikes_required = get_int(self.config, "STRIKES_REQUIRED", 2)
 
         def consider(ip, reason, tier):
             if ip in candidates:
@@ -115,18 +116,25 @@ class AuditEngine:
         # The ratio condition is not optional. A site with a broken theme or a
         # missing favicon serves 404s to real visitors, and without the ratio
         # this rule would convict the victims of the operator's own bug.
-        threshold_404 = get_int(self.config, "THRESHOLD_404", 30)
+        threshold_404 = get_int(self.config, "THRESHOLD_404_PER_INTERVAL", 30)
         ratio_404_min = float(self.config.get("RATIO_404_MIN", 0.60) or 0.60)
-        for ip, count in metrics.get("panel_404", {}).items():
-            hits = metrics["hits"].get(ip, 0)
-            if count <= threshold_404 or hits <= 0 or self._volume_suspended():
-                continue
-            ratio = count / hits
-            if ratio < ratio_404_min:
-                continue
-            profile, label = self._client_profile(ip, metrics)
-            consider(ip, f"PathBruteForce | 404: {count}x of {hits} ({ratio:.0%}){label}",
-                     self._volume_tier(count, threshold_404, profile))
+        if not self._volume_suspended():
+            for ip, count in self._volume_strikes("p404", threshold_404,
+                                                  metrics).items():
+                if count < strikes_required:
+                    continue
+                hits = metrics["hits"].get(ip, 0)
+                not_found = metrics.get("panel_404", {}).get(ip, 0)
+                if hits <= 0:
+                    continue
+                ratio = not_found / hits
+                if ratio < ratio_404_min:
+                    continue
+                profile, label = self._client_profile(ip, metrics)
+                consider(ip,
+                         f"PathBruteForce | 404: {not_found}x of {hits} "
+                         f"({ratio:.0%}), {count} intervals{label}",
+                         self._volume_tier(not_found, threshold_404, profile))
 
         # Login attempts outside WordPress. Only POST counts — a GET of /login is
         # the form itself, and counting it would flag everyone who looked at it.
@@ -142,23 +150,42 @@ class AuditEngine:
             consider(ip, f"GenericLoginBrute | login POST: {count}x"
                          f"{f' | rejected: {rejected}x' if rejected else ''}", tier)
 
-        threshold_hits = get_int(self.config, "THRESHOLD_HITS", 40)
-        for ip, count in metrics["hits"].items():
-            profile, label = self._client_profile(ip, metrics)
-            effective = self._effective_threshold(threshold_hits, profile)
-            if count > effective and not self._volume_suspended():
-                consider(ip, f"CloudScraper | WebApp | Hits: {count}x{label}",
-                         self._volume_tier(count, threshold_hits, profile))
+        # Volume rules are judged PER INTERVAL and require repetition. One modern
+        # page view is 30-80 requests, so a real visitor opening three pages is
+        # indistinguishable from an attacker inside a single interval — measured
+        # peaks of 134, 88 and 67 on a production host all belonged to ordinary
+        # people. What separates them is that the visitor is loud once and the
+        # crawler is loud for hours. Requiring STRIKES_REQUIRED separate
+        # intervals removed every one of those false positives without losing a
+        # single genuine offender.
+        threshold_hits = get_int(self.config, "THRESHOLD_HITS_PER_INTERVAL", 60)
+        if not self._volume_suspended():
+            for ip, count in self._volume_strikes("hits", threshold_hits,
+                                                  metrics).items():
+                if count < strikes_required:
+                    continue
+                profile, label = self._client_profile(ip, metrics)
+                peak = self.parser.window.peak("hits").get(ip, 0)
+                consider(ip,
+                         f"CloudScraper | WebApp | {peak}x in one interval, "
+                         f"{count} intervals over {threshold_hits}{label}",
+                         self._volume_tier(peak, threshold_hits, profile))
 
-        threshold_bw = get_int(self.config, "THRESHOLD_BW_MB", 30) * 1024 * 1024
-        for ip, total in metrics["bw"].items():
-            profile, label = self._client_profile(ip, metrics)
-            effective = self._effective_threshold(threshold_bw, profile)
-            if total > effective and not self._volume_suspended():
-                mb = total / 1024 / 1024
-                hits = metrics["hits"].get(ip, 0)
-                consider(ip, f"HighBandwidth | BW: {mb:.1f}MB | Hits: {hits}x{label}",
-                         self._volume_tier(total, threshold_bw, profile))
+        threshold_bw = get_int(self.config, "THRESHOLD_BW_MB_PER_INTERVAL", 20)
+        threshold_bw_bytes = threshold_bw * 1024 * 1024
+        if not self._volume_suspended():
+            peaks_bw = self.parser.window.peak("bw")
+            for ip, count in self._volume_strikes("bw", threshold_bw_bytes,
+                                                  metrics).items():
+                if count < strikes_required:
+                    continue
+                profile, label = self._client_profile(ip, metrics)
+                mb = peaks_bw.get(ip, 0) / 1024 / 1024
+                consider(ip,
+                         f"HighBandwidth | {mb:.1f}MB in one interval, "
+                         f"{count} intervals over {threshold_bw}MB{label}",
+                         self._volume_tier(peaks_bw.get(ip, 0), threshold_bw_bytes,
+                                           profile))
 
         # Every guard runs here, once, for every candidate.
         allowed = {}
@@ -202,6 +229,34 @@ class AuditEngine:
             allowed.update(networks)
 
         return allowed
+
+    def _volume_strikes(self, metric, threshold, metrics):
+        """Intervals in which this address was over the line for `metric`."""
+        return self.parser.window.strikes(metric, threshold)
+
+    def _renamed_setting_warning(self):
+        """
+        THRESHOLD_HITS and THRESHOLD_BW_MB meant "per WINDOW_HOURS". The
+        per-interval rules mean something else entirely, so the names changed
+        rather than the meaning changing underneath a number the operator tuned.
+
+        A host running THRESHOLD_HITS=400 for a day is the case that matters: read
+        as a per-interval figure on that same host, whose busiest address peaked
+        at 474, it would have switched detection off almost completely and said
+        nothing. So the old names are refused loudly instead of reinterpreted.
+        """
+        stale = [name for name in ("THRESHOLD_HITS", "THRESHOLD_BW_MB",
+                                   "THRESHOLD_404", "THRESHOLD_SUBNET_HITS",
+                                   "THRESHOLD_SUBNET_BW_MB")
+                 if name in self.config]
+        if not stale:
+            return None
+        return ("[SETTING_RENAMED] {} no longer exist: they counted per "
+                "WINDOW_HOURS, and the volume rules now count per interval. "
+                "Their values are IGNORED. Set the *_PER_INTERVAL names instead "
+                "— the defaults are calibrated, and a stale value silently "
+                "reinterpreted would have been far worse than this message."
+                .format(", ".join(stale)))
 
     def _volume_suspended(self):
         """
@@ -328,14 +383,22 @@ class AuditEngine:
         max_width_v4 = get_int(self.config, "SUBNET_MAX_WIDTH_V4", 24)
         max_width_v6 = get_int(self.config, "SUBNET_MAX_WIDTH_V6", 64)
 
-        threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS", 2000)
-        threshold_bw = get_int(self.config, "THRESHOLD_SUBNET_BW_MB", 300) * 1024 * 1024
+        # Per interval, like the per-address volume rules, and for the same
+        # reason: a CGNAT or campus range genuinely does light up for one
+        # interval when several of its users load a page at once. Measured on a
+        # production host, p99 of per-interval hits across all /24s and /56s was
+        # 67; the one coordinated crawler sat at 3,031.
+        threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS_PER_INTERVAL", 300)
+        threshold_bw = get_int(self.config, "THRESHOLD_SUBNET_BW_MB_PER_INTERVAL", 60)
+        threshold_bw_bytes = threshold_bw * 1024 * 1024
         threshold_auth = get_int(self.config, "THRESHOLD_SUBNET_AUTH", 20)
         threshold_intent = get_int(self.config, "THRESHOLD_SUBNET_INTENT", 20)
+        strikes_required = get_int(self.config, "STRIKES_REQUIRED", 2)
 
+        window = self.parser.window
         proposed = {}
 
-        for cidr, agg in self.parser.window.subnet_rollup(prefix_v4, prefix_v6).items():
+        for cidr, agg in window.subnet_rollup(prefix_v4, prefix_v6).items():
             members = agg.get("members", 0)
             if members < min_members:
                 continue
@@ -344,6 +407,9 @@ class AuditEngine:
             tier = None
 
             intent = agg["wp"] + agg["xmlrpc"] + agg["scan"] + agg["p401"]
+            bw_strikes = window.net_strikes(agg, "bw", threshold_bw_bytes)
+            hit_strikes = window.net_strikes(agg, "hits", threshold_hits)
+
             if agg["auth"] > threshold_auth:
                 reason = (f"SubnetAuthBruteForce | {members} hosts | "
                           f"failed logins: {agg['auth']}x")
@@ -352,12 +418,12 @@ class AuditEngine:
                 reason = (f"SubnetCoordinatedAttack | {members} hosts | "
                           f"brute force/recon: {intent}x")
                 tier = TIER_PERMANENT
-            elif agg["bw"] > threshold_bw and not self._volume_suspended():
-                mb = agg["bw"] / 1024 / 1024
+            elif bw_strikes >= strikes_required and not self._volume_suspended():
+                mb = agg["peak_bw"] / 1024 / 1024
                 reason = (f"SubnetHighBandwidth | {members} hosts | "
-                          f"BW: {mb:.1f}MB | Hits: {agg['hits']}x")
-                tier = self._volume_tier(agg["bw"], threshold_bw)
-            elif agg["hits"] > threshold_hits and not self._volume_suspended():
+                          f"{mb:.1f}MB in one interval, {bw_strikes} intervals")
+                tier = self._volume_tier(agg["peak_bw"], threshold_bw_bytes)
+            elif hit_strikes >= strikes_required and not self._volume_suspended():
                 total = agg["pages"] + agg["assets"]
                 ratio = (agg["assets"] / total) if total else 0.0
                 profile = PROFILE_UNKNOWN
@@ -367,8 +433,9 @@ class AuditEngine:
                                else PROFILE_UNKNOWN)
                 suffix = f" | assets {ratio:.0%}" if total else ""
                 reason = (f"SubnetFlood | {members} hosts | "
-                          f"Hits: {agg['hits']}x{suffix}")
-                tier = self._volume_tier(agg["hits"], threshold_hits, profile)
+                          f"{agg['peak_hits']}x in one interval, "
+                          f"{hit_strikes} intervals{suffix}")
+                tier = self._volume_tier(agg["peak_hits"], threshold_hits, profile)
 
             if reason is None:
                 continue
@@ -409,14 +476,17 @@ class AuditEngine:
         min_members = get_int(self.config, "SUBNET6_WIDE_MIN_PREFIXES", 8)
         max_width = get_int(self.config, "SUBNET6_WIDE_MAX_WIDTH", 56)
 
-        threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS", 2000)
-        threshold_bw = get_int(self.config, "THRESHOLD_SUBNET_BW_MB", 300) * 1024 * 1024
+        threshold_hits = get_int(self.config, "THRESHOLD_SUBNET_HITS_PER_INTERVAL", 300)
+        threshold_bw = get_int(self.config, "THRESHOLD_SUBNET_BW_MB_PER_INTERVAL", 60)
+        threshold_bw_bytes = threshold_bw * 1024 * 1024
         threshold_auth = get_int(self.config, "THRESHOLD_SUBNET_AUTH", 20)
         threshold_intent = get_int(self.config, "THRESHOLD_SUBNET_INTENT", 20)
+        strikes_required = get_int(self.config, "STRIKES_REQUIRED", 2)
 
+        window = self.parser.window
         wide = {}
 
-        for cidr, agg in self.parser.window.subnet_rollup(24, prefix).items():
+        for cidr, agg in window.subnet_rollup(24, prefix).items():
             if ":" not in cidr:
                 continue
             members = agg.get("members", 0)
@@ -434,17 +504,18 @@ class AuditEngine:
                 tier = TIER_PERMANENT
             elif self._volume_suspended():
                 continue
-            elif agg["bw"] > threshold_bw:
+            elif window.net_strikes(agg, "bw", threshold_bw_bytes) >= strikes_required:
                 # The /24 tier has had a bandwidth rule since 1.0; this tier did
                 # not, so an IPv6 source draining bandwidth across many /64s was
                 # caught at no level at all.
-                mb = agg["bw"] / 1024 / 1024
+                mb = agg["peak_bw"] / 1024 / 1024
                 reason = (f"Subnet6HighBandwidth | {members} /64s | "
-                          f"BW: {mb:.1f}MB | Hits: {agg['hits']}x")
-                tier = self._volume_tier(agg["bw"], threshold_bw)
-            elif agg["hits"] > threshold_hits:
-                reason = f"Subnet6Flood | {members} /64s | Hits: {agg['hits']}x"
-                tier = self._volume_tier(agg["hits"], threshold_hits)
+                          f"{mb:.1f}MB in one interval")
+                tier = self._volume_tier(agg["peak_bw"], threshold_bw_bytes)
+            elif window.net_strikes(agg, "hits", threshold_hits) >= strikes_required:
+                reason = (f"Subnet6Flood | {members} /64s | "
+                          f"{agg['peak_hits']}x in one interval")
+                tier = self._volume_tier(agg["peak_hits"], threshold_hits)
             else:
                 continue
 
@@ -476,6 +547,9 @@ class AuditEngine:
         flags["GUARD_STATS"] = dict(self.guard.stats)
         if getattr(self, "flags_extra", None):
             flags["PROFILING_OFF"] = self.flags_extra
+        renamed = self._renamed_setting_warning()
+        if renamed:
+            flags["SETTING_RENAMED"] = renamed
         if getattr(self.parser, "catchup", False):
             # Stated out loud on every channel. The circuit breaker this
             # replaced announced itself only on stderr, which cron discards, and
@@ -530,6 +604,8 @@ def main():
             print(flags["PROFILING_OFF"], file=sys.stderr)
         if flags.get("CATCHUP_RUN"):
             print(f"[CATCHUP_RUN] {flags['CATCHUP_RUN']}", file=sys.stderr)
+        if flags.get("SETTING_RENAMED"):
+            print(flags["SETTING_RENAMED"], file=sys.stderr)
 
     # Exit 1 means "findings present", not failure (docs/DESIGN.md §18).
     return 1 if candidates else 0

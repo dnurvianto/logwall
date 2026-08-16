@@ -759,11 +759,20 @@ check_configuration() {
             "Use the prefixed defaults in /etc/logwall.conf (LOGWALL_BL4, LOGWALL_WL4, ...)"
     fi
 
-    local hits="${THRESHOLD_HITS:-40}"
-    if [ "$hits" -lt 100 ] 2>/dev/null; then
+    # The old THRESHOLD_HITS counted per WINDOW_HOURS. A value tuned for that
+    # meaning, read as a per-interval figure, would switch detection almost
+    # entirely off and say nothing, so a leftover name is reported not obeyed.
+    if [ -n "${THRESHOLD_HITS:-}" ]; then
+        pf_warn THRESHOLD_RENAMED \
+            "THRESHOLD_HITS=${THRESHOLD_HITS} is no longer read: it counted per WINDOW_HOURS, and volume now counts per interval. The value is IGNORED." \
+            "sed -i '/^THRESHOLD_HITS=/d' /etc/logwall.conf   # then set THRESHOLD_HITS_PER_INTERVAL"
+    fi
+
+    local hits="${THRESHOLD_HITS_PER_INTERVAL:-60}"
+    if [ "$hits" -lt 20 ] 2>/dev/null; then
         pf_warn THRESHOLD_TOO_LOW \
-            "THRESHOLD_HITS=${hits} over ${WINDOW_HOURS:-24}h. One page view is 30-80 requests; real visitors will be flagged." \
-            "sed -i 's/^THRESHOLD_HITS=.*/THRESHOLD_HITS=400/' /etc/logwall.conf"
+            "THRESHOLD_HITS_PER_INTERVAL=${hits} per ${EVAL_INTERVAL_SEC:-120}s. One page view is 30-80 requests, so an ordinary visitor would be over the line every time." \
+            "sed -i 's/^THRESHOLD_HITS_PER_INTERVAL=.*/THRESHOLD_HITS_PER_INTERVAL=60/' /etc/logwall.conf"
     fi
 
     if [ "${ENFORCE:-0}" = "1" ]; then
