@@ -314,13 +314,22 @@ release that would never have blocked them.
 Every apply now re-checks the existing blacklist and releases what a guard refuses
 today, naming the guard.
 
-Only volume-class entries are ever looked up. A crawler trips volume rules by
-crawling; it does not ask for `/wp-login.php` or `/.env`, and no amount of DNS turns
-a brute force into Googlebot. Those entries are therefore skipped, and the ones that
-could be a crawler are checked first — which is not a micro-optimisation. The first
-version walked the blacklist in sorted order, so on the host this was written for
-the per-run budget went to fifty addresses beginning "100." while the Bingbot range
-it existed to rescue sat unreached for another twenty-six cycles. Cheap in the steady state: the other guards are list
+Every entry is verified, with no filter by verdict class — and the reason that
+sentence is here is that an earlier attempt did filter, on the reasoning that a
+crawler trips volume rules by crawling and would never ask for a source file. Field
+data killed it within the hour, twice:
+
+    40.77.167.20   blocked that same day as WebshellHunter. Bingbot follows stale
+                   links to .php pages and collects 404s doing it.
+    37 others      migrated from a retired blocker whose format had no reason field,
+                   so their recorded "class" is a date string and no filter could
+                   ever have matched it.
+
+There is no reliable signal for which entries deserve a lookup, and inventing one
+only decided which mistakes stayed in place longest. The budget and the cache carry
+this instead: one lookup per address per FCRDNS_CACHE_DAYS, so successive runs advance
+through a legacy list rather than re-walking it. At the default budget a 1,300-entry
+blacklist finishes inside a quarter of an hour of cycles. Cheap in the steady state: the other guards are list
 lookups, and FCrDNS has a budget and a cache, so a large legacy list drains over a
 few cycles rather than stalling one.
 

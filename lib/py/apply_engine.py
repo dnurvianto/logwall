@@ -366,20 +366,26 @@ class ApplyEngine:
         if not get_bool(self.config, "REVALIDATE_BLACKLIST", True):
             return []
 
-        def could_be_a_crawler(entry):
-            return entry.reason.split("|", 1)[0].strip() in VOLUME_CLASSES
-
-        # Volume-class entries first, because those are the only ones a DNS lookup
-        # can change — and the per-run lookup budget is spent in the order this loop
-        # walks. The first version walked sorted(entries), so on a host with 1,326
-        # entries the budget went to whatever sorted first as a STRING: fifty
-        # addresses beginning "100." while the Bingbot range it was written to
-        # rescue sat unreached for another twenty-six cycles.
-        order = sorted(entries, key=lambda t: (not could_be_a_crawler(entries[t]), t))
-
+        # Every entry is verified, with no filter by verdict class.
+        #
+        # An earlier version here skipped intent-class entries on the reasoning that
+        # a crawler trips volume rules by crawling and would never ask for a source
+        # file. Field data killed that within the hour, twice over:
+        #
+        #   40.77.167.20   blocked TODAY as WebshellHunter — Bingbot follows stale
+        #                  links to .php pages and collects 404s doing it
+        #   37 others      migrated from a retired blocker whose format had no
+        #                  reason field, so their "class" is a date string and no
+        #                  filter could ever have matched it
+        #
+        # So there is no reliable signal for which entries deserve a lookup, and
+        # inventing one only decided which mistakes stayed in place longest. The
+        # budget and the cache carry this instead: a lookup is spent once per
+        # address per FCRDNS_CACHE_DAYS, so successive runs advance through a legacy
+        # list rather than re-walking it. At the default budget a 1,300-entry
+        # blacklist finishes in about a quarter of an hour of cycles.
         released = []
-        for target in order:
-            verify = could_be_a_crawler(entries[target])
+        for target in sorted(entries):
             if "/" in target:
                 # A range is judged by the stricter network rules, which refuse on
                 # OVERLAP rather than membership — exactly what should happen if a
@@ -388,7 +394,7 @@ class ApplyEngine:
                     target, get_int(self.config, "MAX_BLOCK_PREFIX_V4", 24),
                     get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
             else:
-                refusal = self.guard.refusal_reason(target, verify_crawler=verify)
+                refusal = self.guard.refusal_reason(target)
             if refusal:
                 released.append((target, refusal))
 
