@@ -768,6 +768,25 @@ check_configuration() {
             "sed -i '/^THRESHOLD_HITS=/d' /etc/logwall.conf   # then set THRESHOLD_HITS_PER_INTERVAL"
     fi
 
+    # Settings the host still carries that the shipped template no longer has.
+    #
+    # A config merge adds keys without overwriting values — correct, that is what
+    # protects an operator's choices — but it also means it can never retire one. So
+    # a key removed upstream stays in /etc/logwall.conf, doing nothing, looking like a
+    # setting. That is the exact shape of the defect this release removed sixteen of:
+    # a switch an operator can set and believe, that no code reads.
+    #
+    # Reported rather than deleted. Editing somebody's config file to tidy it is not
+    # an installer's business, and the line may be carrying a comment they wrote.
+    if [ -r "$LOGWALL_CONF" ] && [ -r "${PF_DIR}/conf/logwall.conf" ]; then
+        local retired
+        retired=$(comm -23             <(grep -oE '^[A-Z_0-9]+=' "$LOGWALL_CONF" | tr -d '=' | sort -u)             <(grep -oE '^[A-Z_0-9]+=' "${PF_DIR}/conf/logwall.conf" | tr -d '=' | sort -u)             | tr '
+' ' ')
+        if [ -n "${retired// /}" ]; then
+            pf_warn SETTING_RETIRED                 "${LOGWALL_CONF} still defines settings this version no longer reads: ${retired}. They do nothing, which is worse than absent - a switch that looks live and is not."                 "Delete those lines from ${LOGWALL_CONF} when convenient. Nothing breaks either way."
+        fi
+    fi
+
     local hits="${THRESHOLD_HITS_PER_INTERVAL:-60}"
     if [ "$hits" -lt 20 ] 2>/dev/null; then
         pf_warn THRESHOLD_TOO_LOW \

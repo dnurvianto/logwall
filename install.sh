@@ -392,6 +392,25 @@ if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
             "Check disk space and permissions on /opt, then retry."
     fi
     [ "$HAD_INSTALL_DIR" -eq 0 ] && record "newtree:${INSTALL_DIR}"
+
+    # `cp -r` adds and overwrites; it never removes. A module deleted upstream
+    # therefore survives every future upgrade, and stale code in lib/py is code that
+    # can still be imported by something written later. Found on a real upgrade:
+    # fcrdns.py, removed from the release, still sitting in /opt/logwall after it.
+    #
+    # Scoped deliberately narrow — only *.py directly under lib/py, only files the
+    # source no longer has. An installer that deletes by pattern is one typo away
+    # from being the incident.
+    if [ -d "${SCRIPT_DIR}/lib/py" ] && [ -d "${INSTALL_DIR}/lib/py" ]; then
+        for installed in "${INSTALL_DIR}"/lib/py/*.py; do
+            [ -e "$installed" ] || continue
+            if [ ! -f "${SCRIPT_DIR}/lib/py/$(basename "$installed")" ]; then
+                rm -f "$installed"
+                echo "[INFO]   removed stale module $(basename "$installed")"
+            fi
+        done
+        rm -rf "${INSTALL_DIR}/lib/py/__pycache__" 2>/dev/null || true
+    fi
 fi
 
 chmod 0750 "${INSTALL_DIR}/logwall" "${INSTALL_DIR}/install.sh" \

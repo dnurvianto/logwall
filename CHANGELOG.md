@@ -332,6 +332,34 @@ wrong twice, once because a crawler had been blocked as WebshellHunter for follo
 stale .php links, and once because 37 entries migrated from a retired blocker had a
 date where their reason should have been.
 
+### Two upgrade defects, found only by upgrading a host without touching it first
+
+Every earlier deployment in this release was preceded by me adjusting the host —
+setting ENFORCE, reinstalling crons, editing a config value. That hid whether
+`install.sh` works on its own, which is the only question that matters for anyone who
+is not me. Doing one upgrade with nothing but `git fetch` and `install.sh` surfaced
+both of these immediately.
+
+**`cp -r` adds and overwrites; it never removes.** A module deleted upstream survived
+the upgrade — `fcrdns.py` was still sitting in `/opt/logwall/lib/py` after the release
+that deleted it. Harmless this time because nothing imports it, and not harmless in
+general: stale code in lib/py is code something written later can still import.
+install.sh now removes `*.py` under lib/py that the source no longer has, scoped
+deliberately narrow, because an installer that deletes by pattern is one typo away
+from being the incident.
+
+**A config merge cannot retire a key.** Adding without overwriting is correct — it is
+what protects an operator's choices — but it means a setting removed upstream stays in
+`/etc/logwall.conf` forever, doing nothing while looking live. Five `FCRDNS_*` keys
+were left behind by this very release. That is the same defect this release removed
+sixteen instances of. preflight now reports them; it does not edit the file, because
+tidying somebody's config is not an installer's business and the line may carry a
+comment they wrote.
+
+Verified on the same host, upgraded again with no preparation: blacklist, whitelist and
+bypass md5 unchanged, ENFORCE preserved, cron intact, crawler ranges installed, and
+preflight naming both leftovers.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet
