@@ -2060,6 +2060,98 @@ check("csf seed: entries CSF holds but the blacklist does not are released at on
       released_seed)
 
 
+# ============================ rc13: profiling gets its own, wider window
+#
+# Measured on a medium-traffic host: 9 of 331 addresses reached 8 requests inside
+# the 30-minute intent window, and a real visitor had 7. Reading pages/assets from
+# that window made the profiling signal inert in production.
+
+pw = log_parser.TrafficWindow(steady(os.path.join(work, "state_pw")),
+                              interval=120, strikes_window=10,
+                              intent_minutes=30, profile_minutes=240)
+check("profwin: the profiling window is eight times the intent window",
+      pw.profile_buckets == 120 and pw.intent_buckets == 15,
+      (pw.profile_buckets, pw.intent_buckets))
+check("profwin: retention follows the widest of the three",
+      pw.keep_buckets == 120, pw.keep_buckets)
+check("profwin: and it reports the span it actually bucketed",
+      pw.profile_minutes() == 240 and pw.intent_minutes() == 30,
+      (pw.profile_minutes(), pw.intent_minutes()))
+
+base = int(time.time())
+old_stamp = base - 200 * 60      # inside 240m, far outside 30m
+for _ in range(9):
+    pw.add("203.0.113.55", "assets", 1, old_stamp)
+    pw.add("203.0.113.55", "wp", 1, old_stamp)
+for _ in range(2):
+    pw.add("203.0.113.55", "pages", 1, base)
+
+check("profwin: assets from three hours ago still count for profiling",
+      pw.profile_sum("assets").get("203.0.113.55") == 9,
+      pw.profile_sum("assets").get("203.0.113.55"))
+check("profwin: but the intent window does not see them",
+      pw.intent_sum("assets").get("203.0.113.55") is None,
+      pw.intent_sum("assets").get("203.0.113.55"))
+check("profwin: an intent counter from three hours ago is OUT of range for intent",
+      pw.intent_sum("wp").get("203.0.113.55") is None,
+      pw.intent_sum("wp").get("203.0.113.55"))
+
+# The subtle one, and the reason prune() had to become metric-aware.
+#
+# _recent() measures from the address's OWN newest bucket, not from now. Retention
+# used to be 15 buckets, so an intent counter simply could not survive long enough
+# to matter. At 120 buckets an address whose last activity was three hours ago would
+# have that activity summed as though it were current — the window is relative, and
+# the address had nothing newer to be relative to.
+stale = log_parser.TrafficWindow(steady(os.path.join(work, "state_pw3")),
+                                 interval=120, strikes_window=10,
+                                 intent_minutes=30, profile_minutes=240)
+for _ in range(9):
+    stale.add("203.0.113.77", "wp", 1, base - 200 * 60)
+check("profwin: before pruning a stale counter WOULD read as current",
+      stale.intent_sum("wp").get("203.0.113.77") == 9,
+      stale.intent_sum("wp").get("203.0.113.77"))
+stale.prune(base)
+check("profwin: pruning strips it, which is what keeps the wider window safe",
+      stale.intent_sum("wp").get("203.0.113.77") is None,
+      stale.intent_sum("wp").get("203.0.113.77"))
+
+# after pruning, the old bucket keeps ONLY the profiling metrics
+pw.prune(base)
+old_index = old_stamp // 120
+kept = pw.entries["203.0.113.55"][old_index]
+check("profwin: past the intent window a bucket keeps only pages/assets",
+      set(kept) <= {"pages", "assets"} and kept.get("assets") == 9, kept)
+check("profwin: so a punishable counter cannot linger in the long window",
+      "wp" not in kept, kept)
+check("profwin: and after pruning intent no longer counts it",
+      pw.intent_sum("wp").get("203.0.113.55") is None,
+      pw.intent_sum("wp").get("203.0.113.55"))
+
+# the boundary is enforced, not merely documented
+try:
+    pw.profile_sum("wp")
+    guarded = False
+except ValueError:
+    guarded = True
+check("profwin: profile_sum refuses any metric that is not a profiling metric",
+      guarded)
+
+# and the real case: a visitor too quiet to judge in 30 minutes becomes judgeable
+quiet = log_parser.TrafficWindow(steady(os.path.join(work, "state_pw2")),
+                                 interval=120, strikes_window=10,
+                                 intent_minutes=30, profile_minutes=240)
+for n in range(12):                      # spread over two hours, 7 in any 30 min
+    stamp = base - (n * 10 * 60)
+    quiet.add("203.0.113.66", "assets", 1, stamp)
+check("profwin: a quiet visitor accumulates enough samples to be characterised",
+      quiet.profile_sum("assets").get("203.0.113.66") == 12,
+      quiet.profile_sum("assets").get("203.0.113.66"))
+check("profwin: which the intent window could never have supplied",
+      (quiet.intent_sum("assets").get("203.0.113.66") or 0) <= 4,
+      quiet.intent_sum("assets").get("203.0.113.66"))
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

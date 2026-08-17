@@ -73,6 +73,11 @@ Request = collections.namedtuple("Request", (
     "moment",
 ))
 
+# The only metrics kept beyond the intent window, and the only ones profiling may
+# read. Both describe what a client fetched, never what it attempted, so neither
+# can be turned into a punishment by a rule that reaches for the wider window.
+PROFILE_METRICS = frozenset(("pages", "assets"))
+
 METRIC_KEYS = ("hits", "wp", "xmlrpc", "scan", "bw", "p401", "auth",
                "pages", "assets", "sua", "p404", "aua", "lpost",
                "src404", "ok")
@@ -283,14 +288,37 @@ class TrafficWindow:
     """
 
     def __init__(self, state_dir, interval=120, strikes_window=10,
-                 intent_minutes=30, max_ips=200000, v6_prefix=64):
+                 intent_minutes=30, max_ips=200000, v6_prefix=64,
+                 profile_minutes=240):
         self.v6_prefix = v6_prefix
         self.path = os.path.join(state_dir, "window.json")
         self.state_dir = state_dir
         self.interval = max(1, interval)
         self.strikes_window = max(1, strikes_window)
         self.intent_buckets = max(1, (intent_minutes * 60) // self.interval)
-        self.keep_buckets = max(self.strikes_window, self.intent_buckets)
+
+        # Client characterisation is a third class of signal, and it wants the
+        # opposite of what the other two want.
+        #
+        # Volume needs a single interval, because a burst is only meaningful
+        # undiluted. Intent needs half an hour, because the base rate is zero and
+        # attackers go slow. But "is there a browser attached to this address" can
+        # only be answered from a client's whole visit — and until rc13 it was
+        # answered from the intent window, because pages/assets were read with
+        # intent_sum() like everything else.
+        #
+        # Measured on a medium-traffic government host: 9 of 331 addresses reached
+        # 8 requests inside 30 minutes. A real visitor had 7. The profiling signal
+        # was therefore inert in production, and the one host where it did fire had
+        # traffic heavy enough to hide the problem.
+        #
+        # Widening the intent window instead would have been the wrong fix: it also
+        # widens the window logwall PUNISHES over, so a brute force would be judged
+        # on four hours of history and the risk of convicting the wrong address goes
+        # up. Only these two metrics get the long view.
+        self.profile_buckets = max(1, (profile_minutes * 60) // self.interval)
+        self.keep_buckets = max(self.strikes_window, self.intent_buckets,
+                                self.profile_buckets)
         self.max_ips = max_ips
         self.entries = {}
         self.dropped_legacy = 0
@@ -379,10 +407,27 @@ class TrafficWindow:
         bucket[metric] = bucket.get(metric, 0) + value
 
     def prune(self, now):
-        oldest = (now // self.interval) - self.keep_buckets
+        current = now // self.interval
+        oldest = current - self.keep_buckets
+        intent_floor = current - self.intent_buckets
+
         for ip in list(self.entries):
-            buckets = {index: metrics for index, metrics in self.entries[ip].items()
-                       if index > oldest}
+            buckets = {}
+            for index, metrics in self.entries[ip].items():
+                if index <= oldest:
+                    continue
+                if index > intent_floor:
+                    buckets[index] = metrics
+                    continue
+                # Past the intent window this bucket exists only to characterise a
+                # client, so it carries only what that needs. Keeping every metric
+                # here would nearly double the state file and, worse, would leave
+                # punishable counters sitting in buckets that no punishing rule is
+                # supposed to see.
+                trimmed = {key: value for key, value in metrics.items()
+                           if key in PROFILE_METRICS}
+                if trimmed:
+                    buckets[index] = trimmed
             if buckets:
                 self.entries[ip] = buckets
             else:
@@ -414,6 +459,28 @@ class TrafficWindow:
         for ip, buckets in self.entries.items():
             total = sum(m.get(metric, 0)
                         for m in self._recent(buckets, self.intent_buckets))
+            if total:
+                out[ip] = total
+        return out
+
+    def profile_minutes(self):
+        """The client-characterisation window, in minutes, as actually bucketed."""
+        return (self.profile_buckets * self.interval) // 60
+
+    def profile_sum(self, metric):
+        """
+        Total over the profiling window. Only for PROFILE_METRICS.
+
+        Deliberately a separate method rather than a parameter on intent_sum(): a
+        rule that punishes must not be able to reach this reach by accident, and a
+        named boundary is harder to cross without noticing than an argument is.
+        """
+        if metric not in PROFILE_METRICS:
+            raise ValueError("profile_sum is only for %s" % (PROFILE_METRICS,))
+        out = {}
+        for ip, buckets in self.entries.items():
+            total = sum(m.get(metric, 0)
+                        for m in self._recent(buckets, self.profile_buckets))
             if total:
                 out[ip] = total
         return out
@@ -561,6 +628,7 @@ class LogParserEngine:
             interval=self.interval,
             strikes_window=get_int(self.config, "STRIKES_WINDOW", 10),
             intent_minutes=get_int(self.config, "INTENT_WINDOW_MIN", 30),
+            profile_minutes=get_int(self.config, "PROFILING_WINDOW_MIN", 240),
             max_ips=get_int(self.config, "WINDOW_MAX_IPS", 200000),
             v6_prefix=get_int(self.config, "IPV6_BLOCK_PREFIX", 64),
         )
@@ -1179,8 +1247,8 @@ class LogParserEngine:
             "panel_401": self.window.intent_sum("p401"),
             "auth_fail": self.window.intent_sum("auth"),
             "attack_ua": self.window.intent_sum("aua"),
-            "pages": self.window.intent_sum("pages"),
-            "assets": self.window.intent_sum("assets"),
+            "pages": self.window.profile_sum("pages"),
+            "assets": self.window.profile_sum("assets"),
             "script_ua": self.window.intent_sum("sua"),
             "hits": self.window.intent_sum("hits"),
             "bw": self.window.intent_sum("bw"),
