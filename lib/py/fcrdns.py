@@ -91,7 +91,12 @@ class FCrDNS:
         # ceiling so a very fast resolver cannot be walked indefinitely.
         self.max_lookups = max(0, int(max_lookups))
         self.max_seconds = max(1, int(max_seconds))
-        self.started = time.time()
+        # Started at the first LOOKUP, not at construction. Getting that wrong cost
+        # an evening: IPGuard is built before the log parse, so on a busy host the
+        # ten seconds were spent reading logs and the budget was already gone by the
+        # time anything asked a question. The symptom was a run that managed two
+        # lookups and looked, from the outside, like DNS being slow.
+        self.started = None
         self.timeout = max(1, int(timeout))
         self.cache_ttl = max(1, int(cache_days)) * 86400
         self.path = os.path.join(state_dir, "rdns_cache.json")
@@ -155,6 +160,9 @@ class FCrDNS:
         record = self.cache.get(key)
         if record is not None:
             return bool(record.get("ok")), record.get("host")
+
+        if self.started is None:
+            self.started = time.time()
 
         if (self.lookups >= self.max_lookups
                 or time.time() - self.started >= self.max_seconds):

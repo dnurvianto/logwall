@@ -2293,6 +2293,17 @@ ft = fcrdns.FCrDNS(os.path.join(work, "state_fc_time"), resolver=slow_resolver,
 os.makedirs(ft.state_dir, exist_ok=True)
 for n in range(40):
     ft.verify("198.51.100.%d" % n)
+# the clock must start at the first LOOKUP, not when the object was built
+lazy = fcrdns.FCrDNS(os.path.join(work, "state_fc_lazy"), resolver=fake_resolver,
+                     max_lookups=1000, max_seconds=2)
+os.makedirs(lazy.state_dir, exist_ok=True)
+check("fcrdns: the clock has not started before the first lookup",
+      lazy.started is None)
+time.sleep(2.2)                     # as if a log parse had taken the whole budget
+check("fcrdns: a lookup after a long parse still gets its budget",
+      lazy.verify("40.77.167.123")[0] and not lazy.exhausted,
+      (lazy.lookups, lazy.exhausted))
+
 check("fcrdns: a dead resolver is cut off by the time budget, not by a count",
       ft.exhausted and ft.lookups <= 4, (ft.lookups, ft.exhausted))
 check("fcrdns: so a stalled run costs about the budget, not 40 timeouts",
