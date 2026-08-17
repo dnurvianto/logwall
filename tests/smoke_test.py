@@ -2353,6 +2353,46 @@ check("rotation: a range with no verified crawler is still blocked",
       "20.65.105.0/24" in bent, sorted(t for t in bent if "/" in t))
 
 
+# ================== revalidation must spend its DNS budget where it can matter
+#
+# The first version walked sorted(entries), so on a host with 1,326 entries the
+# per-run lookup budget went to whatever sorted first as a STRING — fifty addresses
+# beginning "100." — while the Bingbot range it was written to rescue sat unreached
+# for another twenty-six cycles.
+ord_state = steady(os.path.join(work, "state_revord"))
+ord_cfg = dict(cfg)
+ord_cfg["STATE_DIR"] = ord_state
+ord_cfg["BLACKLIST"] = os.path.join(work, "blacklist_revord.txt")
+ord_cfg["FCRDNS_MAX_LOOKUPS_PER_RUN"] = "3"
+with open(ord_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
+    # sorts first as a string, and can never be a crawler
+    for n in range(1, 9):
+        fh.write("100.26.122.%d    # 2026-08-16 01:00 | ReconScanner | PERMANENT | "
+                 "strike=1 | expires=-\n" % n)
+    # sorts later, and is the one a lookup can actually rescue
+    fh.write("40.77.167.123    # 2026-08-16 01:00 | CloudScraper | PERMANENT | "
+             "strike=1 | expires=-\n")
+
+ord_engine = apply_engine.ApplyEngine(ord_cfg)
+ord_engine.guard = ord_engine.audit.guard = ip_guard.IPGuard(
+    ord_cfg, resolver=fake_resolver)
+ord_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, ord_entries = ord_engine.execute(dry_run=False)
+
+check("revalidate: the verified crawler is released on the FIRST run",
+      "40.77.167.123" not in ord_entries, sorted(ord_entries))
+check("revalidate: named as the crawler guard, with the host that proved it",
+      any(r == "VERIFIED_CRAWLER" for t, r in ord_engine.released
+          if t == "40.77.167.123"), ord_engine.released)
+check("revalidate: intent-class entries are never looked up at all",
+      ord_engine.guard.fcrdns.lookups == 1, ord_engine.guard.fcrdns.lookups)
+check("revalidate: so a tiny budget is still enough",
+      not ord_engine.guard.fcrdns.exhausted)
+check("revalidate: and the intent-class entries stay blocked",
+      sum(1 for t in ord_entries if t.startswith("100.26.122.")) == 8,
+      sorted(t for t in ord_entries if t.startswith("100.")))
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

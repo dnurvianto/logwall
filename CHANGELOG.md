@@ -312,7 +312,15 @@ left to review it. That is how 38 Bingbot addresses were still being enforced by
 release that would never have blocked them.
 
 Every apply now re-checks the existing blacklist and releases what a guard refuses
-today, naming the guard. Cheap in the steady state: the other guards are list
+today, naming the guard.
+
+Only volume-class entries are ever looked up. A crawler trips volume rules by
+crawling; it does not ask for `/wp-login.php` or `/.env`, and no amount of DNS turns
+a brute force into Googlebot. Those entries are therefore skipped, and the ones that
+could be a crawler are checked first — which is not a micro-optimisation. The first
+version walked the blacklist in sorted order, so on the host this was written for
+the per-run budget went to fifty addresses beginning "100." while the Bingbot range
+it existed to rescue sat unreached for another twenty-six cycles. Cheap in the steady state: the other guards are list
 lookups, and FCrDNS has a budget and a cache, so a large legacy list drains over a
 few cycles rather than stalling one.
 

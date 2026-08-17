@@ -45,6 +45,17 @@ COMMENT_SAFE_RE = re.compile(r'[^\w\s.:/|=+-]')
 # Every verdict name logwall can write into a csf.deny comment. Used to recognise
 # our own entries there — never to guess at ownership. lfd's comments begin with a
 # distinct `lfd:` prefix, so the two cannot be confused.
+# Verdicts that describe HOW MUCH an address asked for. Only these can plausibly
+# belong to a search engine: a crawler trips volume rules by crawling, and never
+# asks for /wp-login.php or /.env. Everything else is a statement of intent, and no
+# amount of DNS makes a brute force into Googlebot — so those are never worth a
+# lookup, which is what keeps verification affordable on a long legacy blacklist.
+VOLUME_CLASSES = frozenset((
+    "CloudScraper", "HighBandwidth", "PathBruteForce",
+    "SubnetFlood", "Subnet6Flood", "SubnetHighBandwidth", "Subnet6HighBandwidth",
+    "RotatingOffender",
+))
+
 LOGWALL_VERDICTS = frozenset((
     "AuthBruteForce", "BruteForce", "CloudScraper", "GenericLoginBrute",
     "HighBandwidth", "IntentComposite", "PanelBruteForce", "PathBruteForce",
@@ -355,8 +366,20 @@ class ApplyEngine:
         if not get_bool(self.config, "REVALIDATE_BLACKLIST", True):
             return []
 
+        def could_be_a_crawler(entry):
+            return entry.reason.split("|", 1)[0].strip() in VOLUME_CLASSES
+
+        # Volume-class entries first, because those are the only ones a DNS lookup
+        # can change — and the per-run lookup budget is spent in the order this loop
+        # walks. The first version walked sorted(entries), so on a host with 1,326
+        # entries the budget went to whatever sorted first as a STRING: fifty
+        # addresses beginning "100." while the Bingbot range it was written to
+        # rescue sat unreached for another twenty-six cycles.
+        order = sorted(entries, key=lambda t: (not could_be_a_crawler(entries[t]), t))
+
         released = []
-        for target in sorted(entries):
+        for target in order:
+            verify = could_be_a_crawler(entries[target])
             if "/" in target:
                 # A range is judged by the stricter network rules, which refuse on
                 # OVERLAP rather than membership — exactly what should happen if a
@@ -365,7 +388,7 @@ class ApplyEngine:
                     target, get_int(self.config, "MAX_BLOCK_PREFIX_V4", 24),
                     get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
             else:
-                refusal = self.guard.refusal_reason(target)
+                refusal = self.guard.refusal_reason(target, verify_crawler=verify)
             if refusal:
                 released.append((target, refusal))
 
@@ -444,8 +467,6 @@ class ApplyEngine:
             groups[key]["members"].add(target)
             groups[key]["classes"].add(signal)
 
-        volume_classes = {"CloudScraper", "HighBandwidth", "Subnet6Flood",
-                          "SubnetFlood", "PathBruteForce"}
         proposed = {}
         for key, group in groups.items():
             if len(group["members"]) < minimum or len(group["classes"]) != 1:
@@ -477,7 +498,7 @@ class ApplyEngine:
             proposed[key] = {
                 "reason": "RotatingOffender | %d addresses, all %s"
                           % (len(group["members"]), signal),
-                "tier": TIER_TEMP if signal in volume_classes else TIER_PERMANENT,
+                "tier": TIER_TEMP if signal in VOLUME_CLASSES else TIER_PERMANENT,
                 "class": signal,
             }
         return proposed

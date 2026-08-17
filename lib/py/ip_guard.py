@@ -264,7 +264,7 @@ class IPGuard:
             return False
         return self._in(ip_obj, self.cdn_nets)
 
-    def refusal_reason(self, ip_str):
+    def refusal_reason(self, ip_str, verify_crawler=True):
         ip_obj = parse_ip(ip_str)
         if ip_obj is None:
             return self._count(REFUSE_INVALID)
@@ -297,6 +297,9 @@ class IPGuard:
         # cheaper guard. It is the only check here that touches the network, so it
         # is also the only one worth spending a DNS lookup on — and by this point
         # the address is one decision away from being blocked.
+        if not verify_crawler:
+            return None
+
         verified, hostname = self.verify_crawler(str(ip_obj))
         if verified:
             self.verified_hosts[str(ip_obj)] = hostname
