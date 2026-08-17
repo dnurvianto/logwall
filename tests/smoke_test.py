@@ -2473,6 +2473,49 @@ check("revalidate: and the genuine offenders all stay blocked",
       sorted(t for t in ent3 if t.startswith("100.")))
 
 
+# ============ a RANGE blocked before verification existed must also be released
+#
+# Measured on a production host: one /24 of msnbot-*.search.msn.com survived five
+# full revalidation passes, because ranges went through refusal_reason_network()
+# which knows nothing about crawlers, and _rotating_ranges() skips a range that is
+# already blocked. Nothing ever looked at it again.
+rr_state = steady(os.path.join(work, "state_revrange"))
+rr_cfg = dict(cfg)
+rr_cfg["STATE_DIR"] = rr_state
+rr_cfg["BLACKLIST"] = os.path.join(work, "blacklist_revrange.txt")
+with open(rr_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
+    fh.write("40.77.167.0/24    # 2026-08-17 19:36 | RotatingOffender | TEMP | "
+             "strike=1 | expires=%d\n" % (int(time.time()) + 86400))
+    fh.write("20.65.105.0/24    # 2026-08-17 19:36 | RotatingOffender | TEMP | "
+             "strike=1 | expires=%d\n" % (int(time.time()) + 86400))
+with open(os.path.join(rr_state, "offender_history.json"), "w",
+          encoding="utf-8") as fh:
+    hist = {"40.77.167.123": {"strike": 1, "last": int(time.time()),
+                              "class": "CloudScraper"},
+            "20.65.105.233": {"strike": 1, "last": int(time.time()),
+                              "class": "CloudScraper"}}
+    json.dump(hist, fh)
+
+rr_engine = apply_engine.ApplyEngine(rr_cfg)
+rr_engine.guard = rr_engine.audit.guard = ip_guard.IPGuard(
+    rr_cfg, resolver=fake_resolver)
+rr_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, rr_entries = rr_engine.execute(dry_run=False)
+
+check("revalidate: a RANGE holding a verified crawler is released",
+      "40.77.167.0/24" not in rr_entries, sorted(rr_entries))
+check("revalidate: and the release names the crawler and the member that proved it",
+      any("search.msn.com" in r and "40.77.167.123" in r
+          for _t, r in rr_engine.released), rr_engine.released)
+check("revalidate: a range of genuine offenders stays blocked",
+      "20.65.105.0/24" in rr_entries, sorted(rr_entries))
+check("revalidate: members are found from history, not by enumerating 256 addresses",
+      rr_engine._members_of("40.77.167.0/24", hist) == ["40.77.167.123"],
+      rr_engine._members_of("40.77.167.0/24", hist))
+check("revalidate: a range with no history members asks nothing",
+      rr_engine._members_of("203.0.113.0/24", hist) == [])
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

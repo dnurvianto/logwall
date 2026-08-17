@@ -302,7 +302,7 @@ class ApplyEngine:
         # Cheap in the steady state: the non-DNS guards are list lookups, and FCrDNS
         # has both a per-run budget and a thirty-day cache, so a large legacy list
         # drains over a few cycles instead of stalling one.
-        self.released = self._release_now_protected(entries)
+        self.released = self._release_now_protected(entries, history)
 
         # 4. Drop entries a wider accepted range already covers.
         #
@@ -361,7 +361,7 @@ class ApplyEngine:
         except OSError:
             pass
 
-    def _release_now_protected(self, entries):
+    def _release_now_protected(self, entries, history=None):
         """Removes entries the guards would refuse if proposed today."""
         if not get_bool(self.config, "REVALIDATE_BLACKLIST", True):
             return []
@@ -393,6 +393,19 @@ class ApplyEngine:
                 refusal = self.guard.refusal_reason_network(
                     target, get_int(self.config, "MAX_BLOCK_PREFIX_V4", 24),
                     get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
+
+                # Those rules know nothing about crawlers, and a range cannot be
+                # verified by enumerating it. So ask about the offenders that put it
+                # on the list, the same way the range was proposed in the first
+                # place. Without this a range blocked before verification existed
+                # stayed blocked forever: measured on a production host, one /24 of
+                # msnbot-*.search.msn.com survived five full revalidation passes
+                # because ranges took a code path that never looked.
+                if not refusal:
+                    ok, member, hostname = self.guard.verify_crawler_any(
+                        self._members_of(target, history))
+                    if ok:
+                        refusal = "VERIFIED_CRAWLER (%s via %s)" % (hostname, member)
             else:
                 refusal = self.guard.refusal_reason(target)
             if refusal:
@@ -401,6 +414,24 @@ class ApplyEngine:
         for target, _reason in released:
             entries.pop(target, None)
         return released
+
+    def _members_of(self, cidr, history):
+        """Addresses in the offender history that fall inside this range."""
+        if not history:
+            return []
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return []
+        members = []
+        for target in history:
+            try:
+                candidate = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                continue
+            if candidate.num_addresses == 1 and contained_in(candidate, net):
+                members.append(target)
+        return sorted(members)
 
     def _rotating_ranges(self, history, entries):
         """

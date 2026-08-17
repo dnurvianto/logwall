@@ -317,7 +317,12 @@ a resolver that stops answering would otherwise turn a two-second run into a
 two-minute one, every two minutes, forever.
 
 The range guard consults it too, on the members that put the range on the list —
-four lookups rather than two hundred and fifty-six.
+four lookups rather than two hundred and fifty-six. So does the revalidation pass,
+and that took one more attempt to get right: ranges were being re-checked through
+`refusal_reason_network()`, which knows nothing about crawlers, while
+`_rotating_ranges()` skips any range already blocked. One /24 of
+msnbot-*.search.msn.com therefore survived five consecutive full revalidation passes,
+because nothing on either path ever looked at it again.
 
 ### Entries already blocked are now re-checked against the guards
 
