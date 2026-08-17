@@ -103,6 +103,13 @@ class AuditEngine:
         candidates = {}
         strikes_required = get_int(self.config, "STRIKES_REQUIRED", 2)
 
+        # Nothing below this line can be trusted if the addresses themselves
+        # cannot. Returning no candidates is not a failure to detect — it is the
+        # only honest answer when an attacker is choosing what the log says. The
+        # flag explains it on every channel, and preflight refuses to enforce.
+        if self.identity_untrusted():
+            return candidates
+
         def consider(ip, reason, tier):
             if ip in candidates:
                 return
@@ -604,6 +611,27 @@ class AuditEngine:
         renamed = self._renamed_setting_warning()
         if renamed:
             flags["SETTING_RENAMED"] = renamed
+
+        # A private address in the peer field is proof that something upstream is
+        # rewriting the client identity from a header it should not have trusted.
+        # Once that is true, an attacker chooses what logwall sees — including
+        # naming the operator's own whitelisted address to buy immunity — so the
+        # honest response is to stop punishing, not to guess which rows are real.
+        peers = flags.get("PEER_NOT_ROUTABLE") or {}
+        if peers:
+            worst = sorted(peers.items(), key=lambda kv: -kv[1])[:5]
+            flags["IDENTITY_UNTRUSTED"] = (
+                "[IDENTITY_UNTRUSTED] {} request(s) arrived carrying a private or "
+                "reserved peer address ({}). A public server cannot be reached from "
+                "those, so the web server is rewriting the client address from a "
+                "forwarding header sent by the client itself. Every identity in this "
+                "log is now a claim, so blocking is suspended for this run. Fix the "
+                "web server: nginx needs set_real_ip_from with the proxy ranges, "
+                "Apache needs RemoteIPTrustedProxy, LiteSpeed needs "
+                "useIpInProxyHeader 0 (or 2 with a Trusted IP list)."
+                .format(sum(peers.values()),
+                        ", ".join("{} x{}".format(ip, n) for ip, n in worst)))
+
         if getattr(self.parser, "catchup", False):
             # Stated out loud on every channel. The circuit breaker this
             # replaced announced itself only on stderr, which cron discards, and
@@ -614,6 +642,12 @@ class AuditEngine:
                 "(brute force, recon, scanner signatures) still applied."
                 .format(self.parser.catchup_reason))
         return flags
+
+    def identity_untrusted(self):
+        """True when this run must not punish anyone (see IDENTITY_UNTRUSTED)."""
+        if not get_bool(self.config, "IDENTITY_GUARD", True):
+            return False
+        return bool(getattr(self.parser, "flags", {}).get("PEER_NOT_ROUTABLE"))
 
     def commit_state(self):
         """Persists cursors + window counters. Only called once a run succeeds."""
@@ -657,6 +691,8 @@ def main():
         if flags.get("LOG_NOT_FOUND"):
             print("[LOG_NOT_FOUND] No access log discovered — detection is inactive.",
                   file=sys.stderr)
+        if flags.get("IDENTITY_UNTRUSTED"):
+            print(flags["IDENTITY_UNTRUSTED"], file=sys.stderr)
         if flags.get("PROFILING_OFF"):
             print(flags["PROFILING_OFF"], file=sys.stderr)
         if flags.get("CATCHUP_RUN"):

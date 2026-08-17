@@ -811,6 +811,66 @@ PYEOF
     else
         pf_info ACCESS_LOGS "Found ${logs} access log file(s)." ""
     fi
+
+    check_peer_identity
+}
+
+# Can the client address in the access log be believed at all?
+#
+# A public web server cannot be reached FROM 10.0.0.5 or 127.0.0.1. One of those
+# sitting in the client field proves the server is rewriting that field from a
+# forwarding header the client itself supplied — and from then on an attacker
+# decides who logwall blocks. Naming the operator's own whitelisted address is
+# enough to become permanently unblockable, and the refusal looks like a routine
+# guard hit.
+#
+# Measured, never parsed from config: this misconfiguration is
+# `useIpInProxyHeader 1` in LiteSpeed, `RemoteIPHeader` with no trusted-proxy list
+# in Apache, `set_real_ip_from 0.0.0.0/0` in nginx, and `trust proxy: true` one
+# layer up in Express. Any list of directive names would always lag; the symptom
+# is identical everywhere.
+check_peer_identity() {
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    local found
+    found=$(PYTHONPATH="${PF_DIR}/lib/py" python3 - "$PANEL_TYPE" <<'PYEOF' 2>/dev/null || echo ""
+import sys
+from config_loader import load_config
+from ip_guard import is_unroutable_source
+from log_parser import COMBINED_RE, LogParserEngine
+
+engine = LogParserEngine(load_config())
+seen = {}
+for path in engine.discover_log_files(sys.argv[1])[:8]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for index, line in enumerate(handle):
+                if index >= 4000:
+                    break
+                match = COMBINED_RE.match(line)
+                if not match:
+                    continue
+                peer = match.group("ip").strip("[]")
+                if is_unroutable_source(peer):
+                    seen[peer] = seen.get(peer, 0) + 1
+    except OSError:
+        continue
+if seen:
+    top = sorted(seen.items(), key=lambda kv: -kv[1])[:3]
+    print(", ".join("%s x%d" % (ip, n) for ip, n in top))
+PYEOF
+)
+
+    if [ -n "$found" ]; then
+        # A warning, not a blocker. Refusing to install would punish an operator
+        # for a misconfiguration they do not yet know they have, and a product that
+        # will not start reads as broken rather than careful. logwall installs,
+        # audits, reports — and declines to block until the addresses can be
+        # trusted, which the engine enforces on its own regardless of ENFORCE.
+        pf_warn IDENTITY_UNTRUSTED \
+            "The access log carries private/reserved client addresses (${found}). A public server cannot be reached from those, so the web server is rewriting the client address from a header the client sent — which lets any visitor choose whose address gets blocked, including yours. logwall will keep auditing but will NOT block until this is fixed, even with ENFORCE=1." \
+            "LiteSpeed: set useIpInProxyHeader to 0, or 2 with a Trusted IP list. nginx: add set_real_ip_from <your proxy range> (never 0.0.0.0/0). Apache: add RemoteIPTrustedProxy alongside RemoteIPHeader. Then re-run: logwall doctor"
+    fi
 }
 
 # ==============================================================================

@@ -1466,6 +1466,126 @@ check("apply: a run leaves a flags record behind",
       os.path.isfile(os.path.join(ev_state, "last_run_flags.json")))
 
 
+# ============================================================== rc13 Fase 2 (R12)
+#
+# The hole these cover was proven on a production host: a request sent from the
+# admin's own address, carrying `X-Forwarded-For: 192.0.2.77`, was recorded as
+# coming from 192.0.2.77. That host has since been fixed, which means the only
+# remaining fixture for this behaviour is right here.
+
+# --- an address in a client-controlled field must never become the identity ----
+ua_log = write("ua_spoof.log", "")
+with open(ua_log, "a", encoding="utf-8") as f:
+    for _ in range(40):
+        f.write('45.33.32.156 - - [%s] "GET /wp-login.php HTTP/1.1" 200 100 '
+                '"http://8.8.4.4/" "Mozilla/5.0 (8.8.8.8)"\n' % stamp_now())
+spoof_cfg = dict(cfg)
+spoof_cfg["STATE_DIR"] = steady(os.path.join(work, "state_spoof"))
+p_spoof = log_parser.LogParserEngine(spoof_cfg)
+p_spoof.cdn_check = guard.is_cdn_edge_ip
+m_spoof = p_spoof.analyze_traffic([ua_log])
+check("spoof: an IP in the user-agent is not treated as the client",
+      m_spoof["hits"].get("8.8.8.8", 0) == 0, m_spoof["hits"].get("8.8.8.8", 0))
+check("spoof: an IP in the referer is not treated as the client either",
+      m_spoof["hits"].get("8.8.4.4", 0) == 0, m_spoof["hits"].get("8.8.4.4", 0))
+check("spoof: the peer that completed the handshake is the client",
+      m_spoof["hits"].get("45.33.32.156", 0) == 40,
+      m_spoof["hits"].get("45.33.32.156", 0))
+
+# --- a forwarded header from a NON-CDN peer must be ignored entirely -----------
+laundry_log = write("laundry.log", "")
+with open(laundry_log, "a", encoding="utf-8") as f:
+    for _ in range(40):
+        f.write('45.33.32.157 - - [%s] "GET /wp-login.php HTTP/1.1" 200 100 '
+                '"-" "curl/8" "198.18.0.9"\n' % stamp_now())
+laundry_cfg = dict(cfg)
+laundry_cfg["STATE_DIR"] = steady(os.path.join(work, "state_laundry"))
+p_laundry = log_parser.LogParserEngine(laundry_cfg)
+p_laundry.cdn_check = guard.is_cdn_edge_ip
+m_laundry = p_laundry.analyze_traffic([laundry_log])
+check("laundry: XFF sent by a direct client is not believed",
+      m_laundry["hits"].get("198.18.0.9", 0) == 0,
+      m_laundry["hits"].get("198.18.0.9", 0))
+check("laundry: the request is still attributed to the real peer",
+      m_laundry["hits"].get("45.33.32.157", 0) == 40,
+      m_laundry["hits"].get("45.33.32.157", 0))
+
+# --- but a CDN edge we trust may still speak for its client --------------------
+check("cdn: a trusted edge can still forward a real client address",
+      m_xff["hits"].get("203.0.113.44", 0) == 30,
+      m_xff["hits"].get("203.0.113.44", 0))
+
+# --- documentation ranges must NOT read as a misconfiguration -----------------
+check("unroutable: RFC1918 is unroutable as a source",
+      ip_guard.is_unroutable_source("10.0.0.5"))
+check("unroutable: loopback is unroutable as a source",
+      ip_guard.is_unroutable_source("127.0.0.1"))
+check("unroutable: link-local is unroutable as a source",
+      ip_guard.is_unroutable_source("169.254.1.1"))
+check("unroutable: IPv6 unique-local is unroutable as a source",
+      ip_guard.is_unroutable_source("fd00::1"))
+check("unroutable: a real public address is routable",
+      not ip_guard.is_unroutable_source("8.8.8.8"))
+check("unroutable: documentation ranges are NOT flagged (they are what tests use)",
+      not ip_guard.is_unroutable_source("203.0.113.7")
+      and not ip_guard.is_unroutable_source("192.0.2.77"))
+
+# --- the OVH case: a private peer means no identity can be trusted ------------
+untrusted_log = write("untrusted.log", "")
+with open(untrusted_log, "a", encoding="utf-8") as f:
+    for _ in range(40):
+        f.write('45.33.32.158 - - [%s] "GET /wp-login.php HTTP/1.1" 200 100 "-" "curl/8"\n'
+                % stamp_now())
+    f.write('127.0.0.1 - - [%s] "GET / HTTP/1.1" 200 100 "-" "curl/8"\n' % stamp_now())
+    f.write('10.0.0.7 - - [%s] "GET / HTTP/1.1" 200 100 "-" "curl/8"\n' % stamp_now())
+
+ident_cfg = dict(cfg)
+ident_cfg["STATE_DIR"] = steady(os.path.join(work, "state_ident"))
+ident_engine = audit_engine.AuditEngine(ident_cfg)
+ident_engine.parser.discover_log_files = lambda panel=None: [untrusted_log]
+ident_engine.parser.discover_auth_logs = lambda: []
+ident_candidates = ident_engine.evaluate_candidates()
+ident_flags = ident_engine.health_flags()
+
+check("identity: a private peer address is recorded",
+      ident_engine.parser.flags["PEER_NOT_ROUTABLE"].get("127.0.0.1") == 1,
+      ident_engine.parser.flags["PEER_NOT_ROUTABLE"])
+check("identity: the run refuses to name any candidate at all",
+      ident_candidates == {}, ident_candidates)
+check("identity: and says why, naming the addresses that prove it",
+      "IDENTITY_UNTRUSTED" in ident_flags.get("IDENTITY_UNTRUSTED", "")
+      and "127.0.0.1" in ident_flags["IDENTITY_UNTRUSTED"],
+      ident_flags.get("IDENTITY_UNTRUSTED", "")[:90])
+check("identity: the message tells the operator which directive to fix",
+      "useIpInProxyHeader" in ident_flags.get("IDENTITY_UNTRUSTED", "")
+      and "set_real_ip_from" in ident_flags["IDENTITY_UNTRUSTED"])
+
+# the brute force in that same log IS real; it is withheld only because the log
+# can no longer prove who sent it
+off_cfg = dict(cfg)
+off_cfg["STATE_DIR"] = steady(os.path.join(work, "state_ident_off"))
+off_cfg["IDENTITY_GUARD"] = "0"
+off_engine = audit_engine.AuditEngine(off_cfg)
+off_engine.parser.discover_log_files = lambda panel=None: [untrusted_log]
+off_engine.parser.discover_auth_logs = lambda: []
+off_candidates = off_engine.evaluate_candidates()
+check("identity: with the guard switched off the same log does produce verdicts",
+      "45.33.32.158" in off_candidates, sorted(off_candidates))
+check("identity: which is exactly what an attacker would gain by aiming it",
+      off_candidates.get("45.33.32.158", {}).get("tier") == "PERMANENT",
+      off_candidates.get("45.33.32.158"))
+
+# --- the guessing function is gone, not merely bypassed -----------------------
+check("identity: the line-scanning recovery function no longer exists",
+      not hasattr(p_spoof, "_recover_real_ip"))
+check("identity: and neither does the token regex it needed",
+      not hasattr(log_parser, "IP_TOKEN_RE"))
+check("identity: dead settings are gone from the shipped config",
+      "TRUSTED_PROXIES=" not in open(
+          os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "conf", "logwall.conf"), encoding="utf-8").read())
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

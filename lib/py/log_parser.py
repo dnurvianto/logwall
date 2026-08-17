@@ -23,7 +23,7 @@ import subprocess
 import time
 
 from config_loader import get_bool, get_int, get_path
-from ip_guard import parse_ip
+from ip_guard import is_unroutable_source, parse_ip
 
 METRIC_KEYS = ("hits", "wp", "xmlrpc", "scan", "bw", "p401", "auth",
                "pages", "assets", "sua", "p404", "aua", "lpost")
@@ -151,6 +151,8 @@ COMBINED_RE = re.compile(
     r'(?P<status>\d{3})\s+'                   # status
     r'(?P<bytes>\d+|-)'                       # bytes sent ("-" means zero)
     r'(?:\s+"[^"]*"\s+"(?P<ua>[^"]*)")?'     # "referer" "user-agent", when present
+    r'(?:\s+"(?P<xff>[^"]*)")?'              # trailing forwarded-for field, if the
+                                             # log_format appends one
 )
 
 MONTHS = {name: number for number, name in enumerate(
@@ -191,11 +193,6 @@ def parse_stamp(stamp):
         _STAMP_CACHE.clear()
     _STAMP_CACHE[stamp] = moment
     return moment
-
-
-# Used to recover the real client address when the peer turns out to be a CDN edge.
-IP_TOKEN_RE = re.compile(
-    r"(?<![\w.:])((?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]{2,}:[0-9A-Fa-f:.]+)(?![\w.])")
 
 
 class TrafficWindow:
@@ -549,9 +546,10 @@ class LogParserEngine:
         # truth may be "1 request of 537", and an operator who believes the first
         # will go looking for a problem that is not there.
         self.flags = {
-            "PARSE_FAIL": {},        # path -> [unparsed, seen]
+            "PARSE_FAIL": {},          # path -> [unparsed, seen]
             "LOG_NOT_FOUND": False,
-            "CDN_NO_REALIP": {},     # path -> [unresolved, seen]
+            "CDN_NO_REALIP": {},       # path -> [unresolved, seen]
+            "PEER_NOT_ROUTABLE": {},   # address -> requests
             "ROTATED": [],
             "BACKEND_LOG_ONLY": [],
         }
@@ -751,19 +749,33 @@ class LogParserEngine:
         return found
 
     # ----------------------------------------------------------------- parsing
-    def _recover_real_ip(self, peer_ip, line):
+    def _real_ip_from_header(self, peer_ip, forwarded):
         """
-        Returns (ip, resolved). Only called when the peer is a CDN edge, so the
-        raw line never has to be retained beyond this point.
+        Returns (ip, resolved). Only called when the peer is a known CDN edge.
+
+        That condition IS the trust anchor, and it is the whole reason this may be
+        read at all — the same rule nginx enforces with `set_real_ip_from` and
+        Apache with `RemoteIPTrustedProxy`. A forwarding header is a claim made by
+        whoever sent it; it becomes evidence only when the sender is someone we
+        already decided to trust.
+
+        The rightmost element is taken deliberately: each proxy appends the address
+        it received from, so anything a client invented is pushed left and ignored.
+
+        What used to be here instead scanned the whole log line for any token
+        shaped like an address and used the first one that was not the peer. The
+        request URI, the referer and the user-agent are all in that line and all
+        under the client's control, and `reversed()` preferred exactly those. A
+        user-agent of "Mozilla/5.0 (8.8.8.8)" was enough to make logwall attribute
+        traffic to 8.8.8.8 — or, worse, to the operator's own whitelisted address,
+        which buys immunity from every guard.
         """
-        for match in reversed(IP_TOKEN_RE.findall(line)):
-            if match == peer_ip:
-                continue
-            candidate = parse_ip(match)
-            if candidate is None or self.cdn_check(str(candidate)):
-                continue
-            return str(candidate), True
-        return peer_ip, False
+        if not forwarded:
+            return peer_ip, False
+        candidate = parse_ip(forwarded.split(",")[-1].strip())
+        if candidate is None or self.cdn_check(str(candidate)):
+            return peer_ip, False
+        return str(candidate), True
 
     def _parse_line(self, line):
         """Returns (ip, uri, bytes, status, forwarded) or None."""
@@ -816,9 +828,15 @@ class LogParserEngine:
         method = request[0].upper() if len(request) >= 2 else ""
         agent = match.group("ua")
 
+        # Captured, not scavenged. Only consulted when the peer is a CDN edge we
+        # already trust — see _real_ip_from_header(). Before rc13 there was no
+        # capture group at all and the address was recovered by scanning the whole
+        # line for anything IP-shaped, which handed the client control of its own
+        # identity through the user-agent field.
         return (str(ip_obj), uri,
                 _safe_int(match.group("bytes")),
-                _safe_int(match.group("status"), 200), "",
+                _safe_int(match.group("status"), 200),
+                (match.group("xff") or ""),
                 classify_uri(uri), classify_user_agent(agent),
                 method, classify_attack_ua(agent),
                 parse_stamp(match.group("ts")))
@@ -919,12 +937,26 @@ class LogParserEngine:
             parsed += 1
             resolved = True
 
-            if forwarded:
-                candidate = parse_ip(forwarded.split(",")[-1].strip())
-                if candidate is not None:
-                    ip = str(candidate)
-            elif self.cdn_check is not None and self.cdn_check(ip):
-                ip, resolved = self._recover_real_ip(ip, line)
+            # The peer address is the only fact in this line. It completed a TCP
+            # handshake, so it cannot be forged. Everything else — the header, the
+            # URI, the user-agent — is a claim the client chose to make.
+            #
+            # A forwarding header is therefore read ONLY when the peer is a CDN
+            # edge we already trust. The previous version read it from anybody,
+            # which let any client rename itself with one header: proven on a
+            # production host, where a request from the admin's own address landed
+            # in the log as 192.0.2.77 because the web server was configured to
+            # believe headers too (see REKOMENDASI R12).
+            if self.cdn_check is not None and self.cdn_check(ip):
+                ip, resolved = self._real_ip_from_header(ip, forwarded)
+            elif is_unroutable_source(ip):
+                # A public web server cannot be reached FROM a private address.
+                # If one is in the peer field, something upstream is rewriting it
+                # from a header it should not have trusted, and no identity in
+                # this log can be relied on.
+                self.flags["PEER_NOT_ROUTABLE"][ip] = \
+                    self.flags["PEER_NOT_ROUTABLE"].get(ip, 0) + 1
+                resolved = False
 
             # `line` goes out of scope here and is never stored.
             yield (ip, uri, size, status, resolved,

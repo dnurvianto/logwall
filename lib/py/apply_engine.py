@@ -263,8 +263,8 @@ class ApplyEngine:
         """
         flags = self.audit.health_flags()
         notable = {}
-        for key in ("PROFILING_OFF", "CATCHUP_RUN", "SETTING_RENAMED",
-                    "LOG_NOT_FOUND"):
+        for key in ("IDENTITY_UNTRUSTED", "PROFILING_OFF", "CATCHUP_RUN",
+                    "SETTING_RENAMED", "LOG_NOT_FOUND"):
             if flags.get(key):
                 notable[key] = flags[key] if isinstance(flags[key], str) else True
         for key in ("CDN_NO_REALIP", "PARSE_FAIL"):
@@ -504,6 +504,8 @@ class ApplyEngine:
             print(f"{prefix}[CDN_NO_REALIP] {label} ({detail})", file=sys.stderr)
         if flags.get("LOG_NOT_FOUND"):
             print(f"{prefix}[LOG_NOT_FOUND] No access log discovered.", file=sys.stderr)
+        if flags.get("IDENTITY_UNTRUSTED"):
+            print(f"{prefix}{flags['IDENTITY_UNTRUSTED']}")
         if flags.get("CATCHUP_RUN"):
             print(f"{prefix}[CATCHUP_RUN] {flags['CATCHUP_RUN']}")
         if flags.get("SETTING_RENAMED"):

@@ -68,6 +68,60 @@ def parse_ip(ip_str):
         return None
 
 
+# Ranges that cannot be the SOURCE of a request arriving at a public server.
+#
+# Spelled out rather than using `is_private`, which in Python also covers the
+# documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Those are
+# unroutable too, but they are what every test suite, tutorial and example config
+# uses, so treating them as evidence of a misconfiguration would raise the alarm
+# in precisely the places people experiment.
+#
+# 100.64.0.0/10 (CGNAT) is also left out on purpose: it appears legitimately
+# inside some provider and container networks, and a false accusation here
+# suspends blocking for the whole host.
+UNROUTABLE_SOURCES = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",   # RFC 1918
+    "127.0.0.0/8",                                     # loopback
+    "169.254.0.0/16",                                  # link-local
+    "0.0.0.0/8",                                       # "this network"
+    "224.0.0.0/4", "255.255.255.255/32",               # multicast, broadcast
+    "::1/128", "::/128",                               # loopback, unspecified
+    "fc00::/7",                                        # unique local
+    "fe80::/10",                                       # link-local
+    "ff00::/8",                                        # multicast
+))
+
+
+def is_unroutable_source(ip_str):
+    """
+    True when an address cannot be a client arriving over the public internet.
+
+    Used as proof, not as a heuristic: a public web server is not reachable FROM
+    10.0.0.5 or 127.0.0.1. If one of those is sitting in the client field of an
+    access log, something upstream rewrote it from a forwarding header it should
+    never have trusted — and once that is happening, no identity in that log can be
+    relied upon, including the ones that look perfectly ordinary.
+
+    Deliberately server-agnostic. The same misconfiguration is
+    `useIpInProxyHeader 1` in LiteSpeed, `RemoteIPHeader` with no trusted-proxy
+    list in Apache, `set_real_ip_from 0.0.0.0/0` in nginx, and `trust proxy: true`
+    one layer up in Express. Enumerating directive names would always lag behind;
+    the symptom is identical everywhere.
+
+    Known limit, stated plainly: this catches the MISCONFIGURATION, not every
+    exploitation of it. An attacker who forges a plausible public address is not
+    detected here. It still earns its place because automated scanners routinely
+    send 127.0.0.1 and 10.0.0.1 in forwarding headers, so on an affected host the
+    evidence shows up within days — and one detection suspends blocking for the
+    whole host, which covers the forged-public case too.
+    """
+    address = parse_ip(ip_str)
+    if address is None:
+        return False
+    return any(address in network for network in UNROUTABLE_SOURCES
+               if network.version == address.version)
+
+
 def _run(cmd, timeout):
     """Runs an external command with a list argv (never shell=True)."""
     try:
