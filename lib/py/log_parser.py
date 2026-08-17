@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import calendar
+import collections
 import glob
 import ipaddress
 import json
@@ -24,6 +25,53 @@ import time
 
 from config_loader import get_bool, get_int, get_path
 from ip_guard import is_unroutable_source, parse_ip
+
+# ------------------------------------------------------------------ fact vs claim
+#
+# The structural rule this codebase learned the hard way, three times in one day:
+#
+#   The PEER address is the only fact in a log line. It completed a TCP handshake,
+#   so it cannot be forged. Everything else — user-agent, referer, forwarding
+#   header, request path — is a CLAIM the client chose to make.
+#
+# A claim is perfectly good evidence of INTENT: `nuclei` in a user-agent is a
+# statement about what the sender came to do, and acting on it is sound. What a
+# claim can never be is IDENTITY, or evidence of good faith:
+#
+#   "nuclei"   -> claim of hostile intent   -> usable as a signal
+#   "GrokBot"  -> claim of good faith       -> NOT usable, and it fooled us
+#   XFF: 1.2.3.4 -> claim about identity    -> only from a peer we already trust
+#   an address inside the URI/referer/UA    -> never anything at all
+#
+# Splitting the two into named fields is the point of these containers. The parser
+# previously passed a bare ten-tuple, and it was exactly that anonymity which let a
+# line-scanning "recover the real IP" helper treat the user-agent as an identity
+# source for three releases without anyone noticing.
+RawRequest = collections.namedtuple("RawRequest", (
+    "peer",       # FACT: completed the handshake
+    "uri",        # claim
+    "size",       # server-side, trustworthy
+    "status",     # server-side, trustworthy
+    "forwarded",  # CLAIM: only read when the peer is a trusted CDN edge
+    "is_asset",   # derived from a claim (uri)
+    "script_ua",  # derived from a claim (user-agent)
+    "method",     # claim
+    "attack_ua",  # derived from a claim — intent, never identity
+    "moment",     # claim, sanity-checked against the run clock
+))
+
+Request = collections.namedtuple("Request", (
+    "ip",         # the identity this request is attributed to
+    "uri",
+    "size",
+    "status",
+    "resolved",   # False -> no trustworthy identity, do not attribute or punish
+    "is_asset",
+    "script_ua",
+    "method",
+    "attack_ua",
+    "moment",
+))
 
 METRIC_KEYS = ("hits", "wp", "xmlrpc", "scan", "bw", "p401", "auth",
                "pages", "assets", "sua", "p404", "aua", "lpost",
@@ -833,12 +881,12 @@ class LogParserEngine:
             except (KeyError, TypeError, ValueError):
                 moment = None
 
-            return (str(ip_obj), uri,
-                    _safe_int(data.get("size", 0)),
-                    _safe_int(data.get("status", 200), 200), forwarded,
-                    classify_uri(uri), classify_user_agent(agent),
-                    str(request.get("method", "") or "").upper(),
-                    classify_attack_ua(agent), moment)
+            return RawRequest(str(ip_obj), uri,
+                              _safe_int(data.get("size", 0)),
+                              _safe_int(data.get("status", 200), 200), forwarded,
+                              classify_uri(uri), classify_user_agent(agent),
+                              str(request.get("method", "") or "").upper(),
+                              classify_attack_ua(agent), moment)
 
         match = COMBINED_RE.match(line)
         if not match:
@@ -858,13 +906,13 @@ class LogParserEngine:
         # capture group at all and the address was recovered by scanning the whole
         # line for anything IP-shaped, which handed the client control of its own
         # identity through the user-agent field.
-        return (str(ip_obj), uri,
-                _safe_int(match.group("bytes")),
-                _safe_int(match.group("status"), 200),
-                (match.group("xff") or ""),
-                classify_uri(uri), classify_user_agent(agent),
-                method, classify_attack_ua(agent),
-                parse_stamp(match.group("ts")))
+        return RawRequest(str(ip_obj), uri,
+                          _safe_int(match.group("bytes")),
+                          _safe_int(match.group("status"), 200),
+                          (match.group("xff") or ""),
+                          classify_uri(uri), classify_user_agent(agent),
+                          method, classify_attack_ua(agent),
+                          parse_stamp(match.group("ts")))
 
     def _read_new_lines(self, filepath):
         """
@@ -957,9 +1005,8 @@ class LogParserEngine:
             if fields is None:
                 continue
 
-            (ip, uri, size, status, forwarded,
-             is_asset, script_ua, method, attack_ua, moment) = fields
             parsed += 1
+            ip = fields.peer
             resolved = True
 
             # The peer address is the only fact in this line. It completed a TCP
@@ -973,7 +1020,7 @@ class LogParserEngine:
             # in the log as 192.0.2.77 because the web server was configured to
             # believe headers too (see REKOMENDASI R12).
             if self.cdn_check is not None and self.cdn_check(ip):
-                ip, resolved = self._real_ip_from_header(ip, forwarded)
+                ip, resolved = self._real_ip_from_header(ip, fields.forwarded)
             elif is_unroutable_source(ip):
                 # A public web server cannot be reached FROM a private address.
                 # If one is in the peer field, something upstream is rewriting it
@@ -984,8 +1031,9 @@ class LogParserEngine:
                 resolved = False
 
             # `line` goes out of scope here and is never stored.
-            yield (ip, uri, size, status, resolved,
-                   is_asset, script_ua, method, attack_ua, moment)
+            yield Request(ip, fields.uri, fields.size, fields.status, resolved,
+                          fields.is_asset, fields.script_ua, fields.method,
+                          fields.attack_ua, fields.moment)
 
         # A file that grew but produced nothing parseable means the log format is
         # unknown. Silently deciding "no attacks" from unreadable data is worse
@@ -1040,8 +1088,12 @@ class LogParserEngine:
 
         for log_path in logs:
             share = self.flags["CDN_NO_REALIP"].setdefault(log_path, [0, 0])
-            for (ip, uri, size, status, resolved, is_asset,
-                 script_ua, method, attack_ua, moment) in self.parse_log_file(log_path):
+            for request in self.parse_log_file(log_path):
+                ip, uri, size, status = (request.ip, request.uri,
+                                         request.size, request.status)
+                resolved, is_asset = request.resolved, request.is_asset
+                script_ua, method = request.script_ua, request.method
+                attack_ua, moment = request.attack_ua, request.moment
                 share[1] += 1
                 if not resolved:
                     # CDN traffic without a usable real IP: audit only. The count

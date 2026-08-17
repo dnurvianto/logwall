@@ -1840,6 +1840,19 @@ check("config: every shipped setting is read by some code path", orphans == [],
       orphans)
 
 
+# ============================================================== rc13 Fase 5 (R13)
+check("factclaim: the peer field is named as the fact it is",
+      log_parser.RawRequest._fields[0] == "peer")
+check("factclaim: the forwarded header is a separate, named field",
+      "forwarded" in log_parser.RawRequest._fields)
+check("factclaim: an attributed request carries whether it could be resolved",
+      "resolved" in log_parser.Request._fields)
+check("factclaim: parsing yields named requests, not anonymous tuples",
+      type(p_spoof._parse_line(
+          '45.33.32.156 - - [%s] "GET / HTTP/1.1" 200 5 "-" "x"' % stamp_now())
+      ).__name__ == "RawRequest")
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")
