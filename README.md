@@ -384,4 +384,4 @@ project's history passed cleanly on a workstation and failed on a server.
 
 ## Licence
 
-MIT.
+Distributed under the MIT License. See [`LICENSE`](LICENSE) for the full text.

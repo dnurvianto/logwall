@@ -96,7 +96,8 @@ If it involves blocking behaviour, include the relevant log lines with the addre
 
 ## Licence
 
-MIT. By contributing you agree your contribution is released under it.
+Distributed under the MIT License — see [`LICENSE`](LICENSE) for the full text. By
+contributing you agree your contribution is released under it.
 
 If the direction of this project does not suit you, forking is a legitimate and expected
 outcome — the licence exists precisely so that a disagreement does not have to become an
