@@ -240,6 +240,30 @@ CSF one. Correct for cron, which cannot answer a prompt, but a human who types i
 told nothing. It now says so, and says that an existing SSH session proves nothing
 because it predates the rules.
 
+### Python 3.6 was never actually supported
+
+`subnet_of()` arrived in Python 3.7. preflight accepts 3.6 and says so out loud, and
+the code has used that method since the /64 aggregation work — so on a host running
+3.6 the apply engine raised `AttributeError` and did nothing at all.
+
+    AttributeError: 'IPv4Network' object has no attribute 'subnet_of'
+    [ERROR] Apply engine failed (exit 1) — no firewall rule was changed.
+
+It was invisible for days because the cron line discarded stderr. The run log added
+in this same release surfaced it within minutes of being switched on, which is the
+clearest argument for that change that could have been asked for: the bug was not
+found by reading code or by the suite, but by finally having somewhere for a failure
+to be written down.
+
+Fixed with a written-out containment test, and the suite now asserts that no 3.7+ API
+appears in the shipped code at all — the guard immediately caught its own docstring,
+which is roughly the right level of paranoia for a compatibility claim.
+
+Worth being precise about the damage: enforcement on that host was never lost. The
+existing chains and sets stayed in place and kept dropping, and the error handler
+refused to touch the firewall on a failed run. What stopped was learning — no new
+detection reached the blocklist for as long as it went unnoticed.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet

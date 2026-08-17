@@ -20,7 +20,7 @@ import time
 from audit_engine import (TIER_PERMANENT, TIER_TEMP, AuditEngine,
                           format_refusals, format_shares)
 from config_loader import get_bool, get_int, get_path, load_config
-from ip_guard import load_networks
+from ip_guard import contained_in, load_networks
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -461,7 +461,7 @@ class ApplyEngine:
                     continue
                 if net.num_addresses >= parent.num_addresses:
                     continue
-                if not net.subnet_of(parent):
+                if not contained_in(net, parent):
                     continue
                 if (entries[target].tier == TIER_PERMANENT
                         and entries[parent_target].tier == TIER_TEMP):

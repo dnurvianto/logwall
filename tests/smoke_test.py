@@ -2152,6 +2152,56 @@ check("profwin: which the intent window could never have supplied",
       quiet.intent_sum("assets").get("203.0.113.66"))
 
 
+# ================================ Python 3.6: the floor preflight actually accepts
+#
+# `subnet_of()` arrived in 3.7. preflight accepts 3.6, so the code has to keep that
+# claim. It did not — a host on 3.6 raised AttributeError on every apply, and cron
+# discarded stderr so nobody saw it. The run log added in this same release surfaced
+# it within minutes of being switched on.
+import ipaddress as _ip
+check("py36: a /64 inside a /56 is contained",
+      ip_guard.contained_in(_ip.ip_network("2a03:2880:f800:10::/64"),
+                            _ip.ip_network("2a03:2880:f800::/56")))
+check("py36: a /24 is not inside an unrelated /24",
+      not ip_guard.contained_in(_ip.ip_network("78.153.140.0/24"),
+                                _ip.ip_network("78.153.141.0/24")))
+check("py36: a single address inside its own /24 is contained",
+      ip_guard.contained_in(_ip.ip_network("78.153.140.39/32"),
+                            _ip.ip_network("78.153.140.0/24")))
+check("py36: a network is contained in itself",
+      ip_guard.contained_in(_ip.ip_network("10.0.0.0/8"),
+                            _ip.ip_network("10.0.0.0/8")))
+check("py36: a wider network is NOT inside a narrower one",
+      not ip_guard.contained_in(_ip.ip_network("10.0.0.0/8"),
+                                _ip.ip_network("10.1.0.0/16")))
+check("py36: families never mix",
+      not ip_guard.contained_in(_ip.ip_network("10.0.0.0/8"),
+                                _ip.ip_network("::/0")))
+
+# matches the stdlib wherever the stdlib has the method at all
+if hasattr(_ip.ip_network("10.0.0.0/8"), "subnet_of"):
+    pairs = [("10.0.0.0/24","10.0.0.0/8"), ("10.0.0.0/8","10.0.0.0/24"),
+             ("192.168.1.0/24","10.0.0.0/8"), ("2001:db8::/48","2001:db8::/32"),
+             ("2001:db8::/32","2001:db8::/48"), ("10.0.0.5/32","10.0.0.0/30")]
+    same = all(ip_guard.contained_in(_ip.ip_network(a), _ip.ip_network(b))
+               == _ip.ip_network(a).subnet_of(_ip.ip_network(b)) for a, b in pairs)
+    check("py36: contained_in agrees with subnet_of on every pair tried", same)
+
+# and no 3.7+ API may creep back into the shipped code
+_libdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "py")
+_offenders = []
+for _name in os.listdir(_libdir):
+    if not _name.endswith(".py"):
+        continue
+    _src = open(os.path.join(_libdir, _name), encoding="utf-8").read()
+    for _api in (".subnet_of(", ".supernet_of(", "capture_output=",
+                 "fromisoformat(", ".removeprefix(", ".removesuffix("):
+        if _api in _src:
+            _offenders.append("%s: %s" % (_name, _api))
+check("py36: no Python 3.7+ API is used while preflight accepts 3.6",
+      _offenders == [], _offenders)
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

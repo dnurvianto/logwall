@@ -14,7 +14,7 @@ import os
 import sys
 
 from config_loader import get_bool, get_int, load_config
-from ip_guard import IPGuard
+from ip_guard import IPGuard, contained_in
 from log_parser import LogParserEngine
 
 # Detections that indicate unmistakable intent are blocked permanently.
@@ -326,8 +326,7 @@ class AuditEngine:
                     member = ipaddress.ip_network(ip, strict=False)
                 except ValueError:
                     continue
-                if any(member.version == n.version and member.subnet_of(n)
-                       for n in nets):
+                if any(contained_in(member, n) for n in nets):
                     del allowed[ip]
 
             allowed.update(networks)
@@ -718,7 +717,7 @@ class AuditEngine:
                     net = ipaddress.ip_network(cidr)
                 except ValueError:
                     continue
-                if any(net.subnet_of(parent) for parent in nets):
+                if any(contained_in(net, parent) for parent in nets):
                     already_proposed.pop(cidr, None)
 
         return wide

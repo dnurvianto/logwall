@@ -92,6 +92,22 @@ UNROUTABLE_SOURCES = tuple(ipaddress.ip_network(cidr) for cidr in (
 ))
 
 
+def contained_in(net, parent):
+    """
+    True when `net` lies entirely inside `parent` — the stdlib's subnet_of test.
+
+    Written out because that method arrived in Python 3.7 and preflight accepts
+    3.6 — a claim the code has to keep. It did not: a host running 3.6 crashed on
+    every apply with AttributeError, and because cron discarded stderr the failure
+    was invisible for days. The run log added in rc13 surfaced it within minutes of
+    being switched on.
+    """
+    if net.version != parent.version:
+        return False
+    return (parent.network_address <= net.network_address
+            and net.broadcast_address <= parent.broadcast_address)
+
+
 def is_unroutable_source(ip_str):
     """
     True when an address cannot be a client arriving over the public internet.
