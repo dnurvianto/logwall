@@ -1795,24 +1795,64 @@ _, tier_entries = tier_engine.execute(dry_run=False)
 check("supersede: a PERMANENT member survives a TEMP range that would expire",
       "45.148.10.238" in tier_entries, sorted(tier_entries))
 
-# --- R1/CSF: removals must be released, not left in another agent's config -----
-rel_path = os.path.join(work, "csf_release.list")
-sup_engine.emit_csf_release(rel_path)
-released = open(rel_path, encoding="utf-8").read().split()
-check("csf: superseded members are queued for release from csf.deny",
-      "78.153.140.39" in released, released[:4])
+# --- R1/CSF: removals must be released, and a missed release must self-heal ----
+#
+# The first version of this derived the release list from one run's deltas, and
+# lost releases in silence. Verified against a real host: three members pruned
+# during a run with ENFORCE=0 left the blacklist while the release list written by
+# that run was overwritten before anything called `csf -dr`. Three entries stayed
+# in another agent's config with nothing tracking them.
+rel_state = os.path.join(work, "state_rel")
+rel_cfg = dict(cfg)
+rel_cfg["STATE_DIR"] = steady(rel_state)
+rel_cfg["BLACKLIST"] = os.path.join(work, "blacklist_rel.txt")
+with open(rel_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
+    handle.write("78.153.140.0/24    # 2026-08-16 09:18 | Subnet | PERMANENT | "
+                 "strike=1 | expires=-\n")
 
+# what CSF is holding for us, including three entries no longer in the blacklist
+with open(os.path.join(rel_state, "csf_pushed.json"), "w", encoding="utf-8") as handle:
+    json.dump(["78.153.140.0/24", "78.153.140.39", "78.153.140.40",
+               "198.18.51.9"], handle)
+
+rel_engine = apply_engine.ApplyEngine(rel_cfg)
+rel_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, rel_entries = rel_engine.execute(dry_run=False)
+rel_path = os.path.join(work, "csf_release.list")
+rel_engine.emit_csf_release(rel_path, rel_entries)
+released = open(rel_path, encoding="utf-8").read().split()
+
+check("csf: entries CSF holds that logwall no longer tracks are released",
+      sorted(released) == ["198.18.51.9", "78.153.140.39", "78.153.140.40"],
+      released)
+check("csf: the entry still on the blacklist is NOT released",
+      "78.153.140.0/24" not in released, released)
+
+# a release only has to be computed once; the record follows the blacklist
+rel_engine2 = apply_engine.ApplyEngine(rel_cfg)
+rel_engine2.audit.evaluate_candidates = lambda panel=None: {}
+_, rel_entries2 = rel_engine2.execute(dry_run=False)
+rel_path2 = os.path.join(work, "csf_release2.list")
+rel_engine2.emit_csf_release(rel_path2, rel_entries2)
+check("csf: once released, the same address is not queued again",
+      open(rel_path2, encoding="utf-8").read().strip() == "",
+      open(rel_path2, encoding="utf-8").read().strip())
+
+# and an expired TEMP block leaves the blacklist, so the diff picks it up
+exp_state = os.path.join(work, "state_exp")
 exp_cfg = dict(cfg)
-exp_cfg["STATE_DIR"] = steady(os.path.join(work, "state_exp"))
+exp_cfg["STATE_DIR"] = steady(exp_state)
 exp_cfg["BLACKLIST"] = os.path.join(work, "blacklist_exp.txt")
 with open(exp_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
     handle.write("198.18.51.9    # 2026-08-15 22:56 | CloudScraper | TEMP | "
                  "strike=1 | expires=%d\n" % (int(time.time()) - 3600))
+with open(os.path.join(exp_state, "csf_pushed.json"), "w", encoding="utf-8") as handle:
+    json.dump(["198.18.51.9"], handle)
 exp_engine = apply_engine.ApplyEngine(exp_cfg)
 exp_engine.audit.evaluate_candidates = lambda panel=None: {}
-exp_engine.execute(dry_run=False)
+_, exp_entries = exp_engine.execute(dry_run=False)
 exp_rel = os.path.join(work, "csf_release_exp.list")
-exp_engine.emit_csf_release(exp_rel)
+exp_engine.emit_csf_release(exp_rel, exp_entries)
 check("csf: an expired TEMP block is released instead of living forever",
       "198.18.51.9" in open(exp_rel, encoding="utf-8").read(),
       open(exp_rel, encoding="utf-8").read().strip())

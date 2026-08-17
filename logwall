@@ -274,12 +274,15 @@ cmd_apply() {
     if [ "$csf_mode" -eq 1 ]; then
         # `csf -d` writes a real block; there is no observe-only equivalent, so
         # the push is the one action gated on ENFORCE in this mode.
+        # Releasing runs regardless of ENFORCE. It removes blocks rather than
+        # adding them, so there is nothing here for the safety switch to protect —
+        # and the first version gated it, which stranded three entries in csf.deny
+        # on the very first host it met: they were pruned during a run with
+        # ENFORCE=0 and no later run ever came back for them.
+        _csf_release "$csf_release"
+
         if [ "$ENFORCE" = "1" ]; then
             _csf_push "$csf_list" || say "[WARN] Some addresses could not be pushed to CSF."
-            # Releases are safe regardless of ENFORCE, but running them only in
-            # this branch keeps the two halves of the ladder symmetrical: a host
-            # that never pushed has nothing of ours to release.
-            _csf_release "$csf_release"
         else
             # `grep -c` prints 0 and THEN exits 1, so `|| echo 0` would emit a
             # second line and the message would break across two lines.

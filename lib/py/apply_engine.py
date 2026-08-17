@@ -494,18 +494,52 @@ class ApplyEngine:
             pass
         return known
 
-    def emit_csf_release(self, path):
+    def _pushed_record_path(self):
+        return os.path.join(self.state_dir, "csf_pushed.json")
+
+    def load_pushed_record(self):
+        """Addresses logwall pushed to CSF, so it knows which are its to release."""
+        try:
+            with open(self._pushed_record_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return set(str(item) for item in data)
+        except (OSError, ValueError):
+            pass
+        return set()
+
+    def emit_csf_release(self, path, entries=None):
         """
         Writes the addresses CSF should stop blocking, one per line.
 
         Without this, `csf -d` was a one-way door: logwall dropped an expired TEMP
         entry from its own blacklist and csf.deny kept it forever, which quietly
-        turned every temporary block on a CSF host into a permanent one. The
+        turned every temporary block on a CSF host into a permanent one. An
         escalation ladder only means something if the bottom rung can be stepped
         off. Redundant members removed by _prune_superseded() go the same way.
+
+        Derived from a durable record of what logwall has pushed, NOT from this
+        run's deltas. The first version used the deltas and lost releases in
+        silence, which showed up the first time it met a real host: three members
+        pruned during a run with ENFORCE=0 left the blacklist, while the release
+        list written by that run was overwritten by the next one before anything
+        called `csf -dr`. Three entries stayed behind in another agent's config with
+        nothing left tracking them.
+
+        Diffing a record makes a missed release self-heal on the following run,
+        which is how the push direction has always worked against csf.deny.
+        Entries lfd added on its own never enter the record, so they are never
+        touched.
         """
-        targets = list(self.expired) + [t for t, _parent in self.superseded]
+        current = set(entries or {})
+        pushed = self.load_pushed_record()
+
+        targets = sorted(pushed - current)
         _atomic_write(path, "\n".join(targets) + ("\n" if targets else ""))
+
+        # The record tracks the blacklist, so a release only has to succeed once.
+        _atomic_write(self._pushed_record_path(),
+                      json.dumps(sorted(current)) + "\n")
         return len(targets)
 
     def emit_csf_list(self, entries, path):
@@ -628,7 +662,7 @@ def main():
         if args.emit_csf:
             engine.emit_csf_list(entries, args.emit_csf)
         if args.emit_csf_release:
-            engine.emit_csf_release(args.emit_csf_release)
+            engine.emit_csf_release(args.emit_csf_release, entries)
 
     return code
 
