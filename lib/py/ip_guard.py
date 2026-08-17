@@ -14,6 +14,7 @@ import os
 import subprocess
 
 from config_loader import get_bool, get_int, get_path
+from fcrdns import FCrDNS
 
 # Reasons an IP is refused for blocking. Reported verbatim so an operator can
 # always tell WHY a candidate never turned into a block.
@@ -26,6 +27,7 @@ REFUSE_GATEWAY = "DEFAULT_GATEWAY"
 REFUSE_PRIVATE = "PRIVATE_RANGE"
 REFUSE_INVALID = "INVALID_IP"
 REFUSE_TOO_WIDE = "RANGE_TOO_WIDE"
+REFUSE_VERIFIED_BOT = "VERIFIED_CRAWLER"
 
 
 def load_networks(filepath):
@@ -194,7 +196,7 @@ class IPGuard:
     constant naming the protection that fired.
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, resolver=None):
         config = config or {}
         self.config = config
 
@@ -234,6 +236,20 @@ class IPGuard:
         self.gateways = discover_gateways(timeout)
 
         self.stats = {}
+        self.verified_hosts = {}
+
+        # Forward-confirmed reverse DNS. docs/DESIGN.md has promised this since 1.0
+        # and nothing implemented it, which is how two /24s of Bingbot came to be
+        # blocked on a production host. A static range list was never going to be
+        # enough — DESIGN.md says so itself, because Google publishes addresses
+        # outside any list it also publishes.
+        self.fcrdns = FCrDNS(
+            get_path(config, "STATE_DIR", "/opt/logwall/data/state"),
+            enabled=get_bool(config, "FCRDNS_VERIFY", True),
+            timeout=get_int(config, "FCRDNS_TIMEOUT_SEC", 3),
+            cache_days=get_int(config, "FCRDNS_CACHE_DAYS", 30),
+            max_lookups=get_int(config, "FCRDNS_MAX_LOOKUPS_PER_RUN", 50),
+            resolver=resolver)
 
     def _in(self, ip_obj, networks):
         for net in networks:
@@ -277,7 +293,32 @@ class IPGuard:
         if ip_obj.is_private and not self.block_private:
             return self._count(REFUSE_PRIVATE)
 
+        # Asked LAST, and only of a candidate that has already survived every
+        # cheaper guard. It is the only check here that touches the network, so it
+        # is also the only one worth spending a DNS lookup on — and by this point
+        # the address is one decision away from being blocked.
+        verified, hostname = self.verify_crawler(str(ip_obj))
+        if verified:
+            self.verified_hosts[str(ip_obj)] = hostname
+            return self._count(REFUSE_VERIFIED_BOT)
+
         return None
+
+    def verify_crawler(self, ip_str):
+        """(verified, hostname) from forward-confirmed reverse DNS."""
+        if self.fcrdns is None:
+            return False, None
+        return self.fcrdns.verify(ip_str)
+
+    def verify_crawler_any(self, ip_list):
+        """(verified, ip, hostname) for the first member that verifies."""
+        if self.fcrdns is None:
+            return False, None, None
+        return self.fcrdns.verify_any(ip_list)
+
+    def save_verification_cache(self):
+        if self.fcrdns is not None:
+            self.fcrdns.save()
 
     def refusal_reason_network(self, cidr_str, max_width_v4=24, max_width_v6=64):
         """

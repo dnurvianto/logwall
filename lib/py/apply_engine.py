@@ -157,6 +157,7 @@ class ApplyEngine:
         self.expired = []
         self.escalated = []
         self.superseded = []
+        self.released = []
 
     # ------------------------------------------------------------------ state
     def load_history(self):
@@ -279,6 +280,19 @@ class ApplyEngine:
             history[target]["last"] = now
             history[target]["class"] = meta["class"]
 
+        # 3c. Release entries a guard would refuse today.
+        #
+        # Guards only ever ran on CANDIDATES, so an entry blocked before a guard
+        # existed — or before a whitelist grew, or before FCrDNS was implemented at
+        # all — stayed blocked forever with nothing left to review it. Measured on a
+        # production host: 38 Bingbot addresses, blocked as CloudScraper under an
+        # earlier release, still enforced.
+        #
+        # Cheap in the steady state: the non-DNS guards are list lookups, and FCrDNS
+        # has both a per-run budget and a thirty-day cache, so a large legacy list
+        # drains over a few cycles instead of stalling one.
+        self.released = self._release_now_protected(entries)
+
         # 4. Drop entries a wider accepted range already covers.
         #
         # evaluate_candidates() removes members covered by a range, but only among
@@ -303,6 +317,7 @@ class ApplyEngine:
         self.save_history(history)
         self.record_events(now)
         self.save_run_flags(now)
+        self.guard.save_verification_cache()
         self.report(entries, dry_run=False)
         return EXIT_OK, entries
 
@@ -334,6 +349,29 @@ class ApplyEngine:
                           json.dumps({"ts": now, "flags": notable}, indent=2) + "\n")
         except OSError:
             pass
+
+    def _release_now_protected(self, entries):
+        """Removes entries the guards would refuse if proposed today."""
+        if not get_bool(self.config, "REVALIDATE_BLACKLIST", True):
+            return []
+
+        released = []
+        for target in sorted(entries):
+            if "/" in target:
+                # A range is judged by the stricter network rules, which refuse on
+                # OVERLAP rather than membership — exactly what should happen if a
+                # whitelist has since grown into it.
+                refusal = self.guard.refusal_reason_network(
+                    target, get_int(self.config, "MAX_BLOCK_PREFIX_V4", 24),
+                    get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
+            else:
+                refusal = self.guard.refusal_reason(target)
+            if refusal:
+                released.append((target, refusal))
+
+        for target, _reason in released:
+            entries.pop(target, None)
+        return released
 
     def _rotating_ranges(self, history, entries):
         """
@@ -415,6 +453,22 @@ class ApplyEngine:
             if key in entries:
                 continue
             signal = next(iter(group["classes"]))
+
+            # A range is not an attacker's just because several of its addresses
+            # tripped the same rule — a search engine crawls from many addresses in
+            # one /24 and trips volume rules doing it. Verified on a production
+            # host, where this guard proposed two /24s of msnbot-*.search.msn.com.
+            #
+            # The members that put the range on this list are exactly the addresses
+            # worth asking about, which is what makes verifying a range affordable:
+            # four lookups, not two hundred and fifty-six.
+            ok, member, hostname = self.guard.verify_crawler_any(
+                sorted(group["members"]))
+            if ok:
+                self.audit.refused[key] = "VERIFIED_CRAWLER (%s via %s)" % (
+                    hostname, member)
+                continue
+
             refusal = self.guard.refusal_reason_network(
                 key, v4_prefix, get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
             if refusal:
@@ -495,6 +549,9 @@ class ApplyEngine:
         for target, parent in self.superseded:
             rows.append({"ts": now, "action": "SUPERSEDED", "target": target,
                          "reason": "covered by " + parent})
+        for target, reason in self.released:
+            rows.append({"ts": now, "action": "RELEASED", "target": target,
+                         "reason": reason})
         if not rows:
             return
 
@@ -769,6 +826,9 @@ class ApplyEngine:
         for target, parent in self.superseded:
             print(f"{prefix}[SUPERSEDED] {target} — already covered by {parent}, "
                   f"removed as redundant")
+        for target, reason in self.released:
+            print(f"{prefix}[RELEASED] {target} — a guard refuses this today "
+                  f"({reason}); removed")
 
         ddns = getattr(self.guard, "ddns", None)
         if ddns is not None:
@@ -793,7 +853,7 @@ class ApplyEngine:
 
         print(f"{prefix}[SUMMARY] new={len(self.added)} expired={len(self.expired)} "
               f"escalated={len(self.escalated)} superseded={len(self.superseded)} "
-              f"total={len(entries)}")
+              f"released={len(self.released)} total={len(entries)}")
 
 
 def _atomic_write(path, content):

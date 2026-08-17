@@ -264,6 +264,58 @@ existing chains and sets stayed in place and kept dropping, and the error handle
 refused to touch the firewall on a failed run. What stopped was learning — no new
 detection reached the blocklist for as long as it went unnoticed.
 
+### FCrDNS existed only in the documentation
+
+docs/DESIGN.md has described forward-confirmed reverse DNS since 1.0 — the cache
+file, the thirty-day TTL, "FCrDNS remains the final authority" — and lib/py
+contained zero lines of it. README listed it as a feature. `KNOWN_GOOD_FILE` was its
+config hook, and it was removed earlier in this release as a dead setting, which is
+how the last trace of the promise disappeared.
+
+The cost of that was measurable, on a host with 1,336 blocked addresses:
+
+    38 Bingbot addresses blocked as CloudScraper, under an earlier release
+    2 whole /24s of msnbot-*.search.msn.com proposed by the new range guard
+
+Nothing in the product had ever checked whether an address belonged to a search
+engine. `bypass_rules.txt` held one static line for Googlebot, and DESIGN.md itself
+explains why that can never be enough: Google crawls from addresses outside any list
+Google publishes.
+
+Now implemented. Two directions, because one proves nothing:
+
+    PTR      40.77.167.123  ->  msnbot-40-77-167-123.search.msn.com
+    forward  that hostname  ->  must resolve back to 40.77.167.123
+
+The PTR is published by whoever owns the address, so anyone can claim to be
+`msnbot-*.search.msn.com`. Only Microsoft can make that name resolve forward to an
+address they control — which is why a list of DOMAINS is safe here while a list of
+ranges is not. The domain list says who would be believed; the forward lookup is
+what proves it. Suffixes match on a dot boundary, so `evil-googlebot.com` does not
+pass as `googlebot.com`.
+
+It is asked last, of a candidate that has already survived every cheaper guard, so
+lookups are spent on decisions rather than on requests. Results cache for thirty
+days. A DNS failure is deliberately NOT cached — a transient outage must not pin a
+real crawler as unverified for a month. Uncached lookups are capped per run, because
+a resolver that stops answering would otherwise turn a two-second run into a
+two-minute one, every two minutes, forever.
+
+The range guard consults it too, on the members that put the range on the list —
+four lookups rather than two hundred and fifty-six.
+
+### Entries already blocked are now re-checked against the guards
+
+Guards only ever ran on candidates. An entry blocked before a guard existed — before
+a whitelist grew, before FCrDNS was written — stayed blocked forever with nothing
+left to review it. That is how 38 Bingbot addresses were still being enforced by a
+release that would never have blocked them.
+
+Every apply now re-checks the existing blacklist and releases what a guard refuses
+today, naming the guard. Cheap in the steady state: the other guards are list
+lookups, and FCrDNS has a budget and a cache, so a large legacy list drains over a
+few cycles rather than stalling one.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet

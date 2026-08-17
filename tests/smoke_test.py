@@ -1757,6 +1757,8 @@ with open(sup_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
                  "PERMANENT | strike=1 | expires=-\n")
     handle.write("78.153.140.39    # 2026-08-15 22:56 | ReconScanner | "
                  "PERMANENT | strike=1 | expires=-\n")
+    handle.write("45.33.32.200    # 2026-08-15 22:56 | ReconScanner | "
+                 "PERMANENT | strike=1 | expires=-\n")
     handle.write("203.0.113.200    # 2026-08-15 22:56 | ReconScanner | "
                  "PERMANENT | strike=1 | expires=-\n")
 
@@ -1775,7 +1777,14 @@ check("supersede: an IPv4 member under an accepted /24 goes too",
       "78.153.140.39" in removed, removed)
 check("supersede: the covering /24 stays", "78.153.140.0/24" in sup_entries)
 check("supersede: an unrelated address is untouched",
-      "203.0.113.200" in sup_entries, sorted(sup_entries))
+      "45.33.32.200" in sup_entries, sorted(sup_entries))
+check("revalidate: an entry that now overlaps the whitelist is released",
+      "203.0.113.200" not in sup_entries
+      and any(t == "203.0.113.200" for t, _r in sup_engine.released),
+      sup_engine.released)
+check("revalidate: and the reason is the guard that refused it",
+      any(r == "WHITELIST" for t, r in sup_engine.released if t == "203.0.113.200"),
+      sup_engine.released)
 check("supersede: each removal names the entry that covers it",
       all(parent for _t, parent in sup_engine.superseded),
       sup_engine.superseded[:2])
@@ -2200,6 +2209,148 @@ for _name in os.listdir(_libdir):
             _offenders.append("%s: %s" % (_name, _api))
 check("py36: no Python 3.7+ API is used while preflight accepts 3.6",
       _offenders == [], _offenders)
+
+
+# ============================ FCrDNS: the guard docs promised and code never had
+#
+# Found by deploying: on a host with 1,336 blocked addresses, 38 were Bingbot, and
+# the range guard escalated that into proposing two whole /24s of
+# msnbot-*.search.msn.com. DESIGN.md had described FCrDNS since 1.0; lib/py
+# contained zero lines of it.
+#
+# Every case below uses an injected resolver. A test that needs DNS is a test that
+# gets skipped, and this is the guard standing between a search engine and a block.
+import fcrdns
+
+FAKE = {
+    # a real crawler: PTR matches a crawler domain AND resolves back
+    "40.77.167.123": ("msnbot-40-77-167-123.search.msn.com",
+                      {"40.77.167.123"}, False),
+    "66.249.66.1":   ("crawl-66-249-66-1.googlebot.com", {"66.249.66.1"}, False),
+    # PTR claims a crawler but the name resolves somewhere else: a forgery
+    "45.33.32.156":  ("crawl-fake.googlebot.com", {"1.2.3.4"}, False),
+    # PTR is a lookalike domain
+    "45.33.32.157":  ("bot.evil-googlebot.com", {"45.33.32.157"}, False),
+    # honest non-crawler
+    "20.65.105.233": ("scanner.example.net", {"20.65.105.233"}, False),
+    # no PTR at all
+    "203.0.113.240": (None, set(), False),
+    # resolver did not answer
+    "203.0.113.241": (None, set(), True),
+}
+
+
+def fake_resolver(ip, timeout):
+    return FAKE.get(ip, (None, set(), False))
+
+
+def verifier(name, **kw):
+    st = os.path.join(work, "state_" + name)
+    os.makedirs(st, exist_ok=True)
+    return fcrdns.FCrDNS(st, resolver=fake_resolver, **kw)
+
+fv = verifier("fc1")
+check("fcrdns: a genuine Bingbot address verifies",
+      fv.verify("40.77.167.123")[0], fv.verify("40.77.167.123"))
+check("fcrdns: a genuine Googlebot address verifies",
+      fv.verify("66.249.66.1")[0])
+check("fcrdns: a PTR that does not resolve BACK is rejected",
+      not fv.verify("45.33.32.156")[0], fv.verify("45.33.32.156"))
+check("fcrdns: a lookalike domain is rejected on the dot boundary",
+      not fv.verify("45.33.32.157")[0], fv.verify("45.33.32.157"))
+check("fcrdns: an honest non-crawler is simply not verified",
+      not fv.verify("20.65.105.233")[0])
+check("fcrdns: no PTR means not verified",
+      not fv.verify("203.0.113.240")[0])
+
+# a resolver outage must not pin a real crawler as unverified for 30 days
+fo = verifier("fc2")
+check("fcrdns: a resolver failure is not verified",
+      not fo.verify("203.0.113.241")[0])
+check("fcrdns: and is NOT cached, so an outage decides nothing for a month",
+      "203.0.113.241" not in fo.cache, fo.cache)
+check("fcrdns: while a real answer IS cached",
+      fo.verify("40.77.167.123")[0] and "40.77.167.123" in fo.cache)
+
+# the cache survives a run and costs no lookups the second time
+fo.save()
+fc = fcrdns.FCrDNS(fo.state_dir, resolver=fake_resolver)
+check("fcrdns: the cache is reloaded from disk",
+      fc.verify("40.77.167.123")[0] and fc.lookups == 0, fc.lookups)
+
+# a broken resolver cannot stall a run
+fb = verifier("fc3", max_lookups=2)
+for n in range(6):
+    fb.verify("198.51.100.%d" % n)
+check("fcrdns: uncached lookups are capped per run", fb.lookups == 2, fb.lookups)
+check("fcrdns: and the run says the budget ran out", fb.exhausted)
+
+# switched off means never consulted
+check("fcrdns: it can be switched off entirely",
+      not verifier("fc4", enabled=False).verify("40.77.167.123")[0])
+
+# the domain matcher on its own
+check("fcrdns: exact domain matches", fcrdns._matches_crawler_domain("google.com"))
+check("fcrdns: subdomain matches",
+      fcrdns._matches_crawler_domain("crawl-1.googlebot.com"))
+check("fcrdns: a suffix without a dot boundary does NOT match",
+      fcrdns._matches_crawler_domain("evilgooglebot.com") is None)
+check("fcrdns: a trailing dot is tolerated",
+      fcrdns._matches_crawler_domain("crawl.googlebot.com."))
+check("fcrdns: empty is not a match", fcrdns._matches_crawler_domain("") is None)
+
+# --- the guard refuses a verified crawler, and says why ----------------------
+gcfg = dict(cfg)
+gcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcguard"))
+fguard = ip_guard.IPGuard(gcfg, resolver=fake_resolver)
+check("guard: a verified crawler is refused for blocking",
+      fguard.refusal_reason("40.77.167.123") == "VERIFIED_CRAWLER",
+      fguard.refusal_reason("40.77.167.123"))
+check("guard: and the hostname that proved it is kept for the report",
+      "search.msn.com" in (fguard.verified_hosts.get("40.77.167.123") or ""),
+      fguard.verified_hosts)
+check("guard: a forged crawler claim is still blockable",
+      fguard.refusal_reason("45.33.32.156") is None,
+      fguard.refusal_reason("45.33.32.156"))
+check("guard: an ordinary attacker is still blockable",
+      fguard.refusal_reason("20.65.105.233") is None)
+
+# --- and the rotation guard must not propose a crawler's range ---------------
+bing_hist = dict(("40.77.167.%d" % n, {"strike": 1, "last": int(time.time()),
+                                       "class": "CloudScraper"})
+                 for n in (123, 3, 60, 76))
+rcfg = dict(cfg)
+rcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcrot"))
+rcfg["BLACKLIST"] = os.path.join(work, "blacklist_fcrot.txt")
+with open(os.path.join(rcfg["STATE_DIR"], "offender_history.json"), "w",
+          encoding="utf-8") as fh:
+    json.dump(bing_hist, fh)
+reng = apply_engine.ApplyEngine(rcfg)
+reng.guard = reng.audit.guard = ip_guard.IPGuard(rcfg, resolver=fake_resolver)
+reng.audit.evaluate_candidates = lambda panel=None: {}
+_, rent = reng.execute(dry_run=False)
+check("rotation: a range holding a verified crawler is NOT blocked",
+      "40.77.167.0/24" not in rent, sorted(t for t in rent if "/" in t))
+check("rotation: and the refusal names the crawler that proved it",
+      any("search.msn.com" in str(v) for v in reng.audit.refused.values()),
+      reng.audit.refused)
+
+# while a range of genuine offenders is still blocked
+bad_hist = dict(("20.65.105.%d" % n, {"strike": 1, "last": int(time.time()),
+                                      "class": "CloudScraper"})
+                for n in (233, 234, 235, 236))
+bcfg = dict(cfg)
+bcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcrot2"))
+bcfg["BLACKLIST"] = os.path.join(work, "blacklist_fcrot2.txt")
+with open(os.path.join(bcfg["STATE_DIR"], "offender_history.json"), "w",
+          encoding="utf-8") as fh:
+    json.dump(bad_hist, fh)
+beng = apply_engine.ApplyEngine(bcfg)
+beng.guard = beng.audit.guard = ip_guard.IPGuard(bcfg, resolver=fake_resolver)
+beng.audit.evaluate_candidates = lambda panel=None: {}
+_, bent = beng.execute(dry_run=False)
+check("rotation: a range with no verified crawler is still blocked",
+      "20.65.105.0/24" in bent, sorted(t for t in bent if "/" in t))
 
 
 print()
