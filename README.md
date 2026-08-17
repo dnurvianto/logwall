@@ -354,6 +354,7 @@ logwall firewall unban <IP>       Manual release
 logwall firewall status           Backend, sets, enforcement, coexistence
 logwall firewall panic            EMERGENCY: detach every logwall hook
 logwall selftest [--repair]       Verify and optionally repair hooks and sets
+logwall config prune-retired      Delete settings this version no longer reads
 logwall uninstall [--purge]       Clean removal, verified
 ```
 

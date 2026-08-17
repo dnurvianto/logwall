@@ -766,6 +766,109 @@ cmd_status() {
     return "$EXIT_OK"
 }
 
+# ------------------------------------------------------- retired settings
+# A setting the current version no longer reads is worse than one that is absent:
+# it looks live. preflight names them (SETTING_RETIRED) and says to delete them
+# when convenient; this is the "when convenient".
+#
+# Deliberately opt-in and never part of an upgrade. install.sh only appends new
+# keys to /etc/logwall.conf, because an unattended editor loose in the operator's
+# config is how a comment and a still-live setting disappear in the same pass.
+cmd_config_prune() {
+    local assume_yes="$1"
+    local template="${LOGWALL_ROOT}/conf/logwall.conf"
+    local backup tmp keyfile retired count left reply
+
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "[ERROR] No config at ${CONF_FILE}." >&2
+        return "$EXIT_CONFIG"
+    fi
+    if [ ! -f "$template" ]; then
+        echo "[ERROR] No template at ${template}; cannot tell a live key from a dead one." >&2
+        return "$EXIT_CONFIG"
+    fi
+
+    # The same comparison preflight makes, so the two can never disagree about
+    # which keys are dead: assignment keys present here and absent upstream.
+    retired=$(comm -23         <(grep -oE '^[A-Z_0-9]+=' "$CONF_FILE" | tr -d '=' | sort -u)         <(grep -oE '^[A-Z_0-9]+=' "$template"  | tr -d '=' | sort -u))
+
+    if [ -z "$retired" ]; then
+        echo "[INFO] ${CONF_FILE} defines no retired settings. Nothing to do."
+        return "$EXIT_OK"
+    fi
+
+    count=$(printf '%s
+' "$retired" | grep -c .)
+    echo "Retired in ${CONF_FILE} — ${count} setting(s) this version does not read:"
+    printf '%s
+' "$retired" | while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        grep -nE "^${key}=" "$CONF_FILE" | sed 's/^/  /'
+    done
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[DRY-RUN] Nothing was written."
+        return "$EXIT_OK"
+    fi
+
+    if [ "$assume_yes" -ne 1 ]; then
+        if [ ! -t 0 ]; then
+            echo "[ABORT] No terminal to confirm on. Re-run with --yes to edit ${CONF_FILE}." >&2
+            return "$EXIT_CONFIG"
+        fi
+        printf 'Delete those lines? [y/N] '
+        read -r reply
+        case "$reply" in
+            [yY]*) ;;
+            *) echo "[ABORT] Nothing was written."; return "$EXIT_OK" ;;
+        esac
+    fi
+
+    backup="${CONF_FILE}.bak-$(date +%Y%m%d_%H%M%S)"
+    if ! cp -p "$CONF_FILE" "$backup"; then
+        echo "[ERROR] Could not write ${backup}; refusing to edit without a backup." >&2
+        return "$EXIT_CONFIG"
+    fi
+
+    # Only the assignment lines go. The comment above a retired setting stays: it
+    # is a note about why the thing existed, and keeping it costs nothing.
+    tmp=$(mktemp)
+    keyfile=$(mktemp)
+    printf '%s
+' "$retired" > "$keyfile"
+    awk -v keyfile="$keyfile" '
+        BEGIN { while ((getline k < keyfile) > 0) if (k != "") dead[k] = 1 }
+        {
+            if (match($0, /^[A-Z_0-9]+=/)) {
+                key = substr($0, 1, RLENGTH - 1)
+                if (key in dead) next
+            }
+            print
+        }' "$CONF_FILE" > "$tmp"
+
+    # This file is sourced by every logwall invocation, so a syntax error here
+    # breaks the tool on the next cron tick. Check before writing, not after.
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp" "$keyfile"
+        echo "[ERROR] The pruned config does not parse; ${CONF_FILE} left untouched." >&2
+        echo "[ERROR] Backup kept at ${backup}." >&2
+        return "$EXIT_CONFIG"
+    fi
+
+    cat "$tmp" > "$CONF_FILE"
+    rm -f "$tmp" "$keyfile"
+
+    left=$(comm -23         <(grep -oE '^[A-Z_0-9]+=' "$CONF_FILE" | tr -d '=' | sort -u)         <(grep -oE '^[A-Z_0-9]+=' "$template"  | tr -d '=' | sort -u) | grep -c . || true)
+
+    echo "[INFO] Removed ${count} retired setting(s) from ${CONF_FILE}."
+    echo "[INFO] Backup: ${backup}"
+    if [ "$left" -ne 0 ]; then
+        echo "[WARN] ${left} retired key(s) still present; check for duplicates or indented lines." >&2
+        return "$EXIT_DEGRADED"
+    fi
+    return "$EXIT_OK"
+}
+
 usage() {
     cat <<'EOF'
 Usage: logwall <command> [options]
@@ -786,6 +889,10 @@ Usage: logwall <command> [options]
   doctor                         Full environment gate (same one install.sh must pass)
                                    exit 0 READY · 1 WARNINGS · 2 BLOCKED
   selftest [--repair]            Verify (and optionally repair) hooks and sets
+  config prune-retired [--yes]   Delete settings this version no longer reads - the
+                                   ones preflight lists as SETTING_RETIRED. Backs the
+                                   file up first, keeps their comments, and refuses
+                                   without a terminal unless --yes.
   version                        Print version and detected environment
 
 Options: --quiet  --dry-run  --json  --no-confirm
@@ -903,6 +1010,21 @@ case "$SUBCOMMAND" in
     selftest)
         cmd_selftest
         exit $?
+        ;;
+
+    config)
+        CONFIG_YES=0
+        for a in "$@"; do [ "$a" = "--yes" ] && CONFIG_YES=1; done
+        case "${1:-}" in
+            prune-retired)
+                cmd_config_prune "$CONFIG_YES"
+                exit $?
+                ;;
+            *)
+                echo "Usage: logwall config prune-retired [--yes] [--dry-run]" >&2
+                exit "$EXIT_CONFIG"
+                ;;
+        esac
         ;;
 
     version)

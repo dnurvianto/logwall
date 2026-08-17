@@ -411,6 +411,31 @@ if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
         done
         rm -rf "${INSTALL_DIR}/lib/py/__pycache__" 2>/dev/null || true
     fi
+
+    # Same rule, same narrowness, for the shell modules: only *.sh directly under
+    # lib/, only names the source no longer carries. lib/py came first because a
+    # stale module there can be imported; a stale lib/*.sh is only sourced by an
+    # explicit name, so it does nothing — until someone reads it and believes it.
+    if [ -d "${SCRIPT_DIR}/lib" ] && [ -d "${INSTALL_DIR}/lib" ]; then
+        for installed in "${INSTALL_DIR}"/lib/*.sh; do
+            [ -e "$installed" ] || continue
+            if [ ! -f "${SCRIPT_DIR}/lib/$(basename "$installed")" ]; then
+                rm -f "$installed"
+                echo "[INFO]   removed stale module $(basename "$installed")"
+            fi
+        done
+    fi
+
+    # State files whose owning module is gone. Named one at a time deliberately:
+    # data/state is the operator's data, not ours, and a pattern that guesses
+    # which of it is dead is the cleverness that eventually deletes a blacklist.
+    # rdns_cache.json belonged to fcrdns.py, which rc13 removed; nothing reads it.
+    for dead in rdns_cache.json; do
+        if [ -f "${INSTALL_DIR}/data/state/${dead}" ]; then
+            rm -f "${INSTALL_DIR}/data/state/${dead}"
+            echo "[INFO]   removed dead state file ${dead}"
+        fi
+    done
 fi
 
 chmod 0750 "${INSTALL_DIR}/logwall" "${INSTALL_DIR}/install.sh" \

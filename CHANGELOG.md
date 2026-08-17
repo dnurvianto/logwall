@@ -360,6 +360,28 @@ Verified on the same host, upgraded again with no preparation: blacklist, whitel
 bypass md5 unchanged, ENFORCE preserved, cron intact, crawler ranges installed, and
 preflight naming both leftovers.
 
+**Naming leftovers is not the same as removing them.** Reporting was the right first
+move, but three kinds of dead weight still accumulated across upgrades and nothing
+ever took them out. Measured on a second host after upgrading it: 23 dead config keys
+and a 9 KB `rdns_cache.json` that belonged to the module this release deleted.
+
+- install.sh now applies the lib/py rule to `lib/*.sh` as well — same narrowness, only
+  names the source no longer carries. A stale shell module is quieter than a stale
+  Python one, because nothing sources it by accident; it is still a file someone will
+  eventually read and believe.
+- Dead state files are removed by name, one at a time, never by pattern. The list is
+  currently `rdns_cache.json`. `data/state` is the operator's data, and a rule that
+  guesses which of it is dead is the cleverness that eventually deletes a blacklist.
+- `logwall config prune-retired` removes the settings preflight names, opt-in and never
+  as part of an upgrade. It backs the file up first, keeps the comments around each
+  retired line, verifies the result still parses with `bash -n` before writing — that
+  file is sourced on every invocation, so a syntax error would break the next cron
+  tick — and refuses to edit anything without a terminal unless given `--yes`.
+
+Automatic pruning during an upgrade was considered and rejected. `install.sh` runs
+unattended, and an unattended editor loose in `/etc/logwall.conf` is how a comment and
+a still-live setting disappear in the same pass.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet
