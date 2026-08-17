@@ -543,10 +543,15 @@ class LogParserEngine:
         self._last_bytes_read = 0
 
         # Health flags surfaced in the report (docs/DESIGN.md §9).
+        #
+        # CDN_NO_REALIP and PARSE_FAIL carry a count, not just a filename. Naming
+        # the whole file for one bad line reads as "this log is unusable" when the
+        # truth may be "1 request of 537", and an operator who believes the first
+        # will go looking for a problem that is not there.
         self.flags = {
-            "PARSE_FAIL": [],
+            "PARSE_FAIL": {},        # path -> [unparsed, seen]
             "LOG_NOT_FOUND": False,
-            "CDN_NO_REALIP": [],
+            "CDN_NO_REALIP": {},     # path -> [unresolved, seen]
             "ROTATED": [],
             "BACKEND_LOG_ONLY": [],
         }
@@ -901,8 +906,10 @@ class LogParserEngine:
         """
         self._last_bytes_read = 0
         parsed = 0
+        seen = 0
 
         for line, _ in self._read_new_lines(filepath):
+            seen += 1
             fields = self._parse_line(line)
             if fields is None:
                 continue
@@ -927,7 +934,7 @@ class LogParserEngine:
         # unknown. Silently deciding "no attacks" from unreadable data is worse
         # than reporting the failure (docs/DESIGN.md §16.3).
         if self._last_bytes_read > 0 and parsed == 0:
-            self.flags["PARSE_FAIL"].append(filepath)
+            self.flags["PARSE_FAIL"][filepath] = [seen, seen]
 
     # ------------------------------------------------------ authentication logs
     def discover_auth_logs(self):
@@ -975,12 +982,15 @@ class LogParserEngine:
                 self.window.add(ip, "auth", 1, now)
 
         for log_path in logs:
+            share = self.flags["CDN_NO_REALIP"].setdefault(log_path, [0, 0])
             for (ip, uri, size, status, resolved, is_asset,
                  script_ua, method, attack_ua, moment) in self.parse_log_file(log_path):
+                share[1] += 1
                 if not resolved:
-                    # CDN traffic without a usable real IP: audit only.
-                    if log_path not in self.flags["CDN_NO_REALIP"]:
-                        self.flags["CDN_NO_REALIP"].append(log_path)
+                    # CDN traffic without a usable real IP: audit only. The count
+                    # is what makes this actionable — one line of 537 is noise, 537
+                    # of 537 means detection on this log is dead.
+                    share[0] += 1
                     continue
 
                 # The request's own time, not the run's. A stamp ahead of the
@@ -1025,6 +1035,12 @@ class LogParserEngine:
                 # who simply looked at the form.
                 if method == "POST" and self.login_path_pattern.search(uri):
                     self.window.add(ip, "lpost", 1, stamp)
+
+        # A log where every line resolved is not a finding; drop it so the flag
+        # only ever names logs that actually lost requests.
+        self.flags["CDN_NO_REALIP"] = {
+            path: share for path, share in self.flags["CDN_NO_REALIP"].items()
+            if share[0] > 0}
 
         # Decided AFTER the read, from what the run actually swallowed, instead
         # of inferred beforehand from the gap between runs.

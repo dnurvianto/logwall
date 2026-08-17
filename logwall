@@ -92,6 +92,29 @@ set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 
 say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 
+# The run log is appended to by cron on every invocation — 720 times a day for
+# the apply job alone — so the tool that fills it is the tool that must bound it.
+# Halved rather than emptied: a run log that vanishes the moment it matters is
+# only marginally better than /dev/null.
+_trim_run_log() {
+    local runlog="${REPORT_DIR:-/var/log/logwall}/run.log"
+    local limit="${RUN_LOG_MAX_KB:-8192}"
+    local size
+    [ -f "$runlog" ] || return 0
+    size=$(du -k "$runlog" 2>/dev/null | awk '{print $1}')
+    [ -n "$size" ] || return 0
+    [ "$size" -gt "$limit" ] 2>/dev/null || return 0
+    local keep tmp
+    keep=$(( $(wc -l < "$runlog" 2>/dev/null || echo 0) / 2 ))
+    [ "$keep" -gt 0 ] 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    tail -n "$keep" "$runlog" > "$tmp" 2>/dev/null && cat "$tmp" > "$runlog"
+    rm -f "$tmp"
+    return 0
+}
+
+_trim_run_log
+
 run_system_discovery
 export PANEL_TYPE HAS_IPV6
 export SET_WHITE4 SET_BLACK4 SET_WHITE6 SET_BLACK6
@@ -605,6 +628,21 @@ cmd_unban() {
     return "$EXIT_OK"
 }
 
+# How many of logwall's own blacklist entries CSF is currently enforcing. In
+# coordination mode this is the only honest count: logwall owns no sets there, and
+# csf.deny also holds entries lfd added on its own, which are not ours to report.
+_count_csf_owned() {
+    local deny="$1"
+    local bl="${BLACKLIST:-/etc/logwall/blacklist_ips.txt}"
+    if [ ! -r "$deny" ] || [ ! -r "$bl" ]; then
+        echo 0
+        return 0
+    fi
+    awk 'FNR==NR { if ($0 !~ /^[[:space:]]*#/ && NF) want[$1]=1; next }
+         { if ($0 !~ /^[[:space:]]*#/ && NF && ($1 in want)) n++ }
+         END { print n+0 }' "$bl" "$deny"
+}
+
 # -------------------------------------------------------------------- status
 cmd_status() {
     echo "=== logwall status ==="
@@ -637,7 +675,16 @@ cmd_status() {
     fi
     echo "Enforcement     : $([ "$ENFORCE" = "1" ] && echo 'ON (dropping)' || echo 'OFF (observe only)')"
 
-    if fw_have_ipset; then
+    # In CSF mode logwall creates none of these sets, but CSF itself installs
+    # ipset — so the old gate on `fw_have_ipset` passed and printed four logwall
+    # sets holding "0 entries" on a host with a live blocklist. Two lines after
+    # saying "logwall owns no chains", it reported the opposite of the truth.
+    if [ "$FIREWALL_BACKEND" = "csf" ]; then
+        local csf_deny csf_owned
+        csf_deny="${CSF_DENY:-/etc/csf/csf.deny}"
+        csf_owned=$(_count_csf_owned "$csf_deny")
+        echo "Blocklist (csf.deny) : ${csf_owned} entries pushed by logwall"
+    elif fw_have_ipset; then
         echo "${SET_WHITE4}      : $(fw_set_count "$SET_WHITE4") entries"
         echo "${SET_BLACK4}      : $(fw_set_count "$SET_BLACK4") entries"
         if [ "${HAS_IPV6:-0}" = "1" ]; then

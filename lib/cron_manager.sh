@@ -24,11 +24,19 @@ install_crons() {
 
     _crontab_without_logwall > "$tmp_cron"
 
+    # Output goes to a run log, not to /dev/null. Every diagnostic logwall emits
+    # — PROFILING_OFF, GUARD refusals, CSF_RESYNC, SETTING_RENAMED, CDN_NO_REALIP
+    # — is written to stderr, and the line installed here used to discard all of
+    # it. A host could have detection switched off for a day and look healthy.
+    # logwall trims this file itself (see _trim_run_log), so no logrotate rule is
+    # required for a tool whose whole point is running unattended.
+    local runlog="${REPORT_DIR:-/var/log/logwall}/run.log"
+
     {
         echo "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/usr/sbin:/usr/bin:/bin ${CRON_MARKER}"
-        echo "${interval} /opt/logwall/logwall firewall apply --no-confirm --quiet >/dev/null 2>&1 ${CRON_MARKER}"
-        echo "${watchdog} /opt/logwall/logwall selftest --repair --quiet >/dev/null 2>&1 ${CRON_MARKER}"
-        echo "5 0 * * * /opt/logwall/logwall firewall report --quiet >/dev/null 2>&1 ${CRON_MARKER}"
+        echo "${interval} /opt/logwall/logwall firewall apply --no-confirm --quiet >>${runlog} 2>&1 ${CRON_MARKER}"
+        echo "${watchdog} /opt/logwall/logwall selftest --repair --quiet >>${runlog} 2>&1 ${CRON_MARKER}"
+        echo "5 0 * * * /opt/logwall/logwall firewall report --quiet >>${runlog} 2>&1 ${CRON_MARKER}"
     } >> "$tmp_cron"
 
     if ! crontab "$tmp_cron"; then

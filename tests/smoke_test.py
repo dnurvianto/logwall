@@ -1357,6 +1357,115 @@ check("rename: a clean config produces no warning",
       apply_engine.ApplyEngine(dict(cfg)).audit._renamed_setting_warning() is None)
 
 
+# ============================================================== rc13 Fase 1
+import audit_engine
+import report_gen
+
+# --- R2: a guard refusal must name the address, not just count it -------------
+refusals = audit_engine.format_refusals({
+    "160.191.180.187": "WHITELIST",
+    "10.0.0.1": "SERVER_OWN_IP",
+    "10.0.0.2": "SERVER_OWN_IP",
+})
+joined = " | ".join(refusals)
+check("guard: the refused address is named, not tallied",
+      "160.191.180.187" in joined, joined)
+check("guard: refusals are grouped by reason",
+      len(refusals) == 2 and any(r.startswith("SERVER_OWN_IP:") for r in refusals),
+      refusals)
+many = audit_engine.format_refusals(
+    dict(("203.0.113.%d" % n, "WHITELIST") for n in range(1, 30)), limit=5)
+check("guard: a long refusal list is capped but says how many are hidden",
+      "+24 more" in many[0], many[0])
+
+# --- R7: a health flag must state the affected share, not the whole file ------
+shares = audit_engine.format_shares({"/var/log/a.log": [1, 537]})
+check("flag: the share is stated, not just the filename",
+      shares["/var/log/a.log"].startswith("1 of 537"), shares)
+dead = audit_engine.format_shares({"/var/log/b.log": [537, 537]})
+check("flag: a fully unusable log reads as 100%",
+      "100%" in dead["/var/log/b.log"], dead)
+check("flag: a legacy list-shaped flag still formats",
+      audit_engine.format_shares(["/var/log/c.log"]) != {},
+      audit_engine.format_shares(["/var/log/c.log"]))
+check("flag: no share means no line", audit_engine.format_shares({}) == {})
+
+# --- R7: CDN_NO_REALIP stays silent when nothing was actually lost ------------
+clean_log = write("cdnshare.log", "")
+with open(clean_log, "a", encoding="utf-8") as f:
+    f.write('203.0.113.7 - - [%s] "GET / HTTP/1.1" 200 100 "-" "Mozilla/5.0"\n'
+            % stamp_now())
+share_cfg = dict(cfg)
+share_cfg["STATE_DIR"] = steady(os.path.join(work, "state_share"))
+p_share = log_parser.LogParserEngine(share_cfg)
+p_share.cdn_check = guard.is_cdn_edge_ip
+p_share.analyze_traffic([clean_log])
+check("cdn: a log that lost nothing raises no CDN_NO_REALIP",
+      p_share.flags["CDN_NO_REALIP"] == {}, p_share.flags["CDN_NO_REALIP"])
+check("cdn: a log that DID lose requests reports the share",
+      audit_engine.format_shares(p_cdn.flags["CDN_NO_REALIP"]) != {},
+      audit_engine.format_shares(p_cdn.flags["CDN_NO_REALIP"]))
+
+# --- R9: the daily report summarises the day that ENDED, not the one that began
+rep_state = os.path.join(work, "state_report")
+os.makedirs(rep_state, exist_ok=True)
+rep_cfg = dict(cfg)
+rep_cfg["STATE_DIR"] = rep_state
+rep_cfg["REPORT_DIR"] = os.path.join(work, "reports")
+rg = report_gen.ReportGenerator(rep_cfg)
+
+midnight = time.mktime(time.strptime("2026-08-17 00:05", "%Y-%m-%d %H:%M"))
+label, start, end = rg._period(midnight)
+check("report: a 00:05 run summarises the previous day", label == "2026-08-16", label)
+check("report: the window is exactly one day", end - start == 86400, end - start)
+check("report: a midday run summarises today",
+      rg._period(time.mktime(time.strptime("2026-08-17 14:00", "%Y-%m-%d %H:%M")))[0]
+      == "2026-08-17")
+
+# --- R9: counted from events, so a block released in the period still counts ---
+with open(os.path.join(rep_state, "events.jsonl"), "w", encoding="utf-8") as f:
+    f.write(json.dumps({"ts": int(start) + 3600, "action": "BLOCK",
+                        "target": "203.0.113.9", "tier": "TEMP"}) + "\n")
+    f.write(json.dumps({"ts": int(start) + 7200, "action": "EXPIRED",
+                        "target": "203.0.113.9"}) + "\n")
+    f.write(json.dumps({"ts": int(start) - 86400, "action": "BLOCK",
+                        "target": "203.0.113.8", "tier": "TEMP"}) + "\n")
+tally = rg._events(start, end)
+check("report: events inside the period are counted", tally.get("BLOCK") == 1, tally)
+check("report: a block released in the same period is still counted",
+      tally.get("EXPIRED") == 1, tally)
+data = rg.collect(midnight)
+check("report: the blocked count comes from the event record",
+      data["blocked_today"] == 1 and data["counted_from"] == "event record", data)
+check("report: the rendered summary names the day it covers",
+      "2026-08-16" in rg.render(data))
+
+# --- R11: run diagnostics reach the report instead of stderr only -------------
+with open(os.path.join(rep_state, "last_run_flags.json"), "w", encoding="utf-8") as f:
+    json.dump({"ts": int(start), "flags": {
+        "PROFILING_OFF": "[PROFILING_OFF] Site asset ratio 8% is below 40%",
+        "CDN_NO_REALIP": {"/var/log/a.log": "1 of 537 requests (0%)"},
+        "GUARD_REFUSED": ["WHITELIST: 160.191.180.187"],
+    }}, f)
+blob = " || ".join(rg.collect(midnight)["flags"])
+check("report: PROFILING_OFF from the last run is stated in the report",
+      "PROFILING_OFF" in blob, blob)
+check("report: the refused address reaches the report too",
+      "160.191.180.187" in blob)
+check("report: the CDN share reaches the report with its count",
+      "1 of 537" in blob)
+
+# --- R9/R11: apply writes the event record and the run flags ------------------
+ev_state = os.path.join(work, "state_events")
+ev_cfg = dict(cfg)
+ev_cfg["STATE_DIR"] = steady(ev_state)
+ev_cfg["BLACKLIST"] = os.path.join(work, "blacklist_events.txt")
+ev_engine = apply_engine.ApplyEngine(ev_cfg)
+ev_engine.execute(dry_run=False)
+check("apply: a run leaves a flags record behind",
+      os.path.isfile(os.path.join(ev_state, "last_run_flags.json")))
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

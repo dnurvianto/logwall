@@ -92,13 +92,82 @@ class ReportGenerator:
         except (OSError, ValueError, TypeError):
             return None
 
-    def collect(self):
+    def _events(self, start, end):
+        """Events recorded between two epochs, as {action: count}."""
+        path = os.path.join(self.state_dir, "events.jsonl")
+        tally = {}
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        stamp = int(row.get("ts", 0))
+                    except (ValueError, TypeError):
+                        continue
+                    if start <= stamp < end:
+                        action = str(row.get("action", "?"))
+                        tally[action] = tally.get(action, 0) + 1
+        except OSError:
+            return None
+        return tally
+
+    def _run_flags(self):
+        """Diagnostics persisted by the last apply run, or {}."""
+        path = os.path.join(self.state_dir, "last_run_flags.json")
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        flags = data.get("flags") if isinstance(data, dict) else None
+        return flags if isinstance(flags, dict) else {}
+
+    def _period(self, now=None):
+        """
+        The day this report is about, as (label, start_epoch, end_epoch).
+
+        Cron runs the report at 00:05, so "today" is five minutes old and counting
+        it produced a number that was structurally almost always zero. The day a
+        report summarises is the one that just ended.
+        """
+        moment = datetime.datetime.fromtimestamp(now) if now else datetime.datetime.now()
+        midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+        boundary = get_int(self.config, "REPORT_PERIOD_CUTOFF_HOUR", 12)
+        if moment.hour < boundary:
+            start = midnight - datetime.timedelta(days=1)
+            end = midnight
+        else:
+            start = midnight
+            end = midnight + datetime.timedelta(days=1)
+        return (start.strftime("%Y-%m-%d"),
+                int(start.timestamp()), int(end.timestamp()))
+
+    def collect(self, now=None):
         blacklist = self._entries(self.blacklist_file)
         whitelist = self._entries(self.whitelist_file)
 
         temp_count = sum(1 for row in blacklist if f"| {TIER_TEMP} " in row)
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        today_count = sum(1 for row in blacklist if f"# {today}" in row)
+        today, start, end = self._period(now)
+
+        # Counted from the event record, so a TEMP block that was created AND
+        # released inside the period still counts as having happened. The old
+        # count read blacklist rows, which cannot see a block that is gone.
+        events = self._events(start, end)
+        if events is None:
+            today_count = sum(1 for row in blacklist if f"# {today}" in row)
+            counted_from = "blacklist rows (no event record yet)"
+        else:
+            today_count = events.get("BLOCK", 0)
+            counted_from = "event record"
+        released = (events or {}).get("EXPIRED", 0)
+        escalated = (events or {}).get("ESCALATE", 0)
 
         flags = []
         enforce = get_bool(self.config, "ENFORCE", False)
@@ -124,6 +193,22 @@ class ReportGenerator:
         if catchup:
             flags.append(f"CATCHUP_RUN ({catchup})")
 
+        # Diagnostics the last run emitted on stderr, which cron discards. Without
+        # this the report can only see the four flags it computes itself, and a
+        # host whose detection is switched off looks identical to a quiet one.
+        for label, detail in sorted(self._run_flags().items()):
+            if isinstance(detail, str):
+                flags.append(detail if detail.startswith("[") else
+                             "{} ({})".format(label, detail))
+            elif isinstance(detail, dict):
+                for path, share in sorted(detail.items()):
+                    flags.append("{}: {} ({})".format(label, path, share))
+            elif isinstance(detail, list):
+                for line in detail:
+                    flags.append("{}: {}".format(label, line))
+            else:
+                flags.append(str(label))
+
         selftest = self._selftest()
         if selftest is None:
             selftest_line = "never recorded"
@@ -142,6 +227,9 @@ class ReportGenerator:
             "blacklist": len(blacklist),
             "blacklist_temp": temp_count,
             "blocked_today": today_count,
+            "released": released,
+            "escalated": escalated,
+            "counted_from": counted_from,
             "enforcing": enforce,
             "selftest": selftest_line,
             "flags": flags,
@@ -172,7 +260,10 @@ class ReportGenerator:
             f"[STATUS] Whitelist entries      : {data['whitelist']}\n"
             f"[STATUS] Blacklist entries      : {data['blacklist']} "
             f"({data['blacklist_temp']} temporary)\n"
-            f"[STATUS] Blocked today          : {data['blocked_today']}\n"
+            f"[STATUS] Blocked on {data['date']}   : {data['blocked_today']} "
+            f"(released {data.get('released', 0)}, "
+            f"escalated {data.get('escalated', 0)})\n"
+            f"[STATUS] Counted from           : {data.get('counted_from', 'unknown')}\n"
             f"[STATUS] Last selftest          : {data.get('selftest', 'unknown')}\n"
             f"{flag_block}\n"
             "==============================================================================\n"

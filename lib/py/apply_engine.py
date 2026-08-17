@@ -17,7 +17,8 @@ import re
 import sys
 import time
 
-from audit_engine import TIER_PERMANENT, TIER_TEMP, AuditEngine
+from audit_engine import (TIER_PERMANENT, TIER_TEMP, AuditEngine,
+                          format_refusals, format_shares)
 from config_loader import get_bool, get_int, get_path, load_config
 from ip_guard import load_networks
 
@@ -246,8 +247,85 @@ class ApplyEngine:
         self.write_blacklist(entries)
         self.audit.commit_state()
         self.save_history(history)
+        self.record_events(now)
+        self.save_run_flags(now)
         self.report(entries, dry_run=False)
         return EXIT_OK, entries
+
+    def save_run_flags(self, now):
+        """
+        Persists this run's diagnostics so the daily report can state them.
+
+        Everything below used to exist only on stderr, which the cron line logwall
+        installs discards. PROFILING_OFF fired on every single run of one host for
+        a day while its report said `[FLAG] none` — the report was not wrong, it
+        simply had no way to know.
+        """
+        flags = self.audit.health_flags()
+        notable = {}
+        for key in ("PROFILING_OFF", "CATCHUP_RUN", "SETTING_RENAMED",
+                    "LOG_NOT_FOUND"):
+            if flags.get(key):
+                notable[key] = flags[key] if isinstance(flags[key], str) else True
+        for key in ("CDN_NO_REALIP", "PARSE_FAIL"):
+            detail = format_shares(flags.get(key))
+            if detail:
+                notable[key] = detail
+        if self.audit.refused:
+            notable["GUARD_REFUSED"] = format_refusals(self.audit.refused)
+
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            _atomic_write(os.path.join(self.state_dir, "last_run_flags.json"),
+                          json.dumps({"ts": now, "flags": notable}, indent=2) + "\n")
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------- event record
+    def record_events(self, now):
+        """
+        Appends what this run actually did to events.jsonl.
+
+        The daily report used to count blacklist rows carrying today's date, which
+        cannot work: a TEMP block created and expired between two reports leaves no
+        row, so the one thing the report exists to state was unstateable. Counting
+        events instead makes a released block still count as having happened.
+        """
+        path = os.path.join(self.state_dir, "events.jsonl")
+        rows = []
+        for entry in self.added:
+            rows.append({"ts": now, "action": "BLOCK", "target": entry.target,
+                         "tier": entry.tier, "reason": entry.reason})
+        for target in self.expired:
+            rows.append({"ts": now, "action": "EXPIRED", "target": target})
+        for target in self.escalated:
+            rows.append({"ts": now, "action": "ESCALATE", "target": target})
+        if not rows:
+            return
+
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+        except OSError:
+            return
+
+        self._trim_events(path)
+
+    def _trim_events(self, path):
+        """Keeps the file bounded. A blocker runs 720 times a day, for years."""
+        keep = get_int(self.config, "EVENT_LOG_MAX_LINES", 20000)
+        try:
+            if os.path.getsize(path) < keep * 120:
+                return
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            if len(lines) <= keep:
+                return
+            _atomic_write(path, "".join(lines[-keep:]))
+        except OSError:
+            pass
 
     def write_blacklist(self, entries):
         header = (
@@ -418,13 +496,12 @@ class ApplyEngine:
                 print(f"{prefix}{line}", file=sys.stderr)
 
         flags = self.audit.health_flags()
-        for reason, count in sorted(flags.get("GUARD_STATS", {}).items()):
-            print(f"{prefix}[GUARD] {reason}: {count} candidate(s) refused")
-        if flags.get("PARSE_FAIL"):
-            print(f"{prefix}[PARSE_FAIL] {', '.join(flags['PARSE_FAIL'])}", file=sys.stderr)
-        if flags.get("CDN_NO_REALIP"):
-            print(f"{prefix}[CDN_NO_REALIP] {', '.join(flags['CDN_NO_REALIP'])}",
-                  file=sys.stderr)
+        for line in format_refusals(self.audit.refused):
+            print(f"{prefix}[GUARD] {line}")
+        for label, detail in sorted(format_shares(flags.get("PARSE_FAIL")).items()):
+            print(f"{prefix}[PARSE_FAIL] {label} ({detail})", file=sys.stderr)
+        for label, detail in sorted(format_shares(flags.get("CDN_NO_REALIP")).items()):
+            print(f"{prefix}[CDN_NO_REALIP] {label} ({detail})", file=sys.stderr)
         if flags.get("LOG_NOT_FOUND"):
             print(f"{prefix}[LOG_NOT_FOUND] No access log discovered.", file=sys.stderr)
         if flags.get("CATCHUP_RUN"):

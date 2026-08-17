@@ -29,6 +29,60 @@ PROFILE_BROWSER = "browser"
 PROFILE_SCRIPT = "script"
 PROFILE_UNKNOWN = "unknown"
 
+# How many refused addresses to name before summarising the rest. A guard that
+# refuses six hundred candidates should not bury the run log, but the first
+# handful are what an operator needs to recognise a mistake.
+REFUSAL_NAMES_MAX = 12
+
+
+def format_refusals(refused, limit=REFUSAL_NAMES_MAX):
+    """
+    'reason: addr, addr (+N more)' lines, grouped by reason.
+
+    Reporting only a per-reason tally hides the single fact that makes the line
+    actionable. `[GUARD] WHITELIST: 1` is true and useless; the address is what
+    tells an operator whether the refusal was right.
+    """
+    grouped = {}
+    for target, reason in refused.items():
+        grouped.setdefault(reason, []).append(str(target))
+
+    lines = []
+    for reason in sorted(grouped):
+        names = sorted(grouped[reason])
+        shown = ", ".join(names[:limit])
+        if len(names) > limit:
+            shown += " (+{} more)".format(len(names) - limit)
+        lines.append("{}: {}".format(reason, shown))
+    return lines
+
+
+def format_shares(shares):
+    """
+    {path: 'N of M requests (P%)'} for flags that carry an affected share.
+
+    Naming a whole file for one bad line reads as "this log is unusable"; an
+    operator who believes that goes hunting for a problem that is not there.
+    Older versions of these flags were plain lists, so a list is still accepted.
+    """
+    out = {}
+    if not shares:
+        return out
+    if not isinstance(shares, dict):
+        return {str(path): "share unknown" for path in shares}
+    for path, share in shares.items():
+        try:
+            hit, seen = int(share[0]), int(share[1])
+        except (TypeError, ValueError, IndexError):
+            out[str(path)] = "share unknown"
+            continue
+        if seen <= 0:
+            out[str(path)] = "{} request(s)".format(hit)
+            continue
+        out[str(path)] = "{} of {} requests ({:.0f}%)".format(
+            hit, seen, 100.0 * hit / seen)
+    return out
+
 
 class AuditEngine:
     def __init__(self, config=None):
@@ -586,17 +640,20 @@ def main():
         for ip, meta in candidates.items():
             print(f"{ip}\t{meta['tier']}\t{meta['reason']}")
 
+        # The address, not a tally. A bare "WHITELIST: 1" sent me looking for a
+        # bug that did not exist, because the line withheld the one fact that
+        # would have explained it (REKOMENDASI R2).
         if engine.refused:
             print(f"[GUARD] {len(engine.refused)} candidate(s) refused by protection rules.",
                   file=sys.stderr)
-        for reason, count in sorted(flags.get("GUARD_STATS", {}).items()):
-            print(f"[GUARD]   {reason}: {count}", file=sys.stderr)
-        if flags.get("PARSE_FAIL"):
-            print(f"[PARSE_FAIL] Unrecognised log format: {', '.join(flags['PARSE_FAIL'])}",
+            for line in format_refusals(engine.refused):
+                print(f"[GUARD]   {line}", file=sys.stderr)
+        for label, detail in sorted(format_shares(flags.get("PARSE_FAIL")).items()):
+            print(f"[PARSE_FAIL] Unrecognised log format: {label} ({detail})",
                   file=sys.stderr)
-        if flags.get("CDN_NO_REALIP"):
+        for label, detail in sorted(format_shares(flags.get("CDN_NO_REALIP")).items()):
             print(f"[CDN_NO_REALIP] Real client IP unavailable, audit only: "
-                  f"{', '.join(flags['CDN_NO_REALIP'])}", file=sys.stderr)
+                  f"{label} ({detail})", file=sys.stderr)
         if flags.get("LOG_NOT_FOUND"):
             print("[LOG_NOT_FOUND] No access log discovered — detection is inactive.",
                   file=sys.stderr)
