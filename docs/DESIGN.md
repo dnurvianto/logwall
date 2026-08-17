@@ -3,7 +3,7 @@
 > **Scope note.** This is the full design, including parts deliberately left out
 > of 1.0. For what is actually implemented and supported today, read
 > [`../README.md`](../README.md) — its **Scope** section is authoritative.
-> Anything described here but absent from that section is roadmap, not behaviour.
+> Anything described here but absent from that section is not implemented.
 
 ## Overview (`logwall`)
 
@@ -1076,10 +1076,9 @@ running many.
 
 ## 19. Uninstall
 
-> **Fleet sync is roadmap, not a feature.** Sharing blocklists between your own servers is
-> listed in the README roadmap and is deliberately outside 1.0. It is described here only so
-> the intent is on record; **nothing implements it**, and this section previously documented
-> two CLI commands that did not exist.
+> **Fleet sync is not a feature.** Sharing blocklists between your own servers is deliberately
+> outside 1.0. It is described here only so the intent is on record; **nothing implements it**,
+> and this section previously documented two CLI commands that did not exist.
 >
 > That gap was not harmless. Half-finished scope shipped as `lib/py/fleet_sync.py` — never
 > called by the CLI, yet present and tested — and it was reached for during a migration and

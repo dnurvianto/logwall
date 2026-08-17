@@ -13,7 +13,6 @@ them will be declined regardless of how well it is written:
 
 - [`README.md`](README.md) → **Scope**, **Not supported**, **What this is NOT**
 - [`docs/DESIGN.md`](docs/DESIGN.md) → **§2 Scope Boundary**, and the T1/T2/T3 support tiers
-- [`README.md`](README.md) → **Roadmap** — features deliberately left outside 1.0, in order
 
 If you believe the boundary itself is wrong, open an issue arguing that first. Do not open a
 pull request that assumes the argument is already won.
