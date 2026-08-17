@@ -264,105 +264,73 @@ existing chains and sets stayed in place and kept dropping, and the error handle
 refused to touch the firewall on a failed run. What stopped was learning — no new
 detection reached the blocklist for as long as it went unnoticed.
 
-### FCrDNS existed only in the documentation
+### Search engines are spared from a published list — and the docs no longer lie
 
-docs/DESIGN.md has described forward-confirmed reverse DNS since 1.0 — the cache
-file, the thirty-day TTL, "FCrDNS remains the final authority" — and lib/py
-contained zero lines of it. README listed it as a feature. `KNOWN_GOOD_FILE` was its
-config hook, and it was removed earlier in this release as a dead setting, which is
-how the last trace of the promise disappeared.
+docs/DESIGN.md has described forward-confirmed reverse DNS since 1.0 — the cache file,
+the thirty-day TTL, "FCrDNS remains the final authority" — and lib/py contained zero
+lines of it. README listed it as a feature. `KNOWN_GOOD_FILE` was its config hook, and
+it was removed earlier in this release as a dead setting, which is how the last trace
+of the promise disappeared.
 
-The cost of that was measurable, on a host with 1,336 blocked addresses:
+What the gap cost, on a host with 1,336 blocked addresses:
 
-    38 Bingbot addresses blocked as CloudScraper, under an earlier release
+    40 Bingbot addresses blocked as CloudScraper, under an earlier release
     2 whole /24s of msnbot-*.search.msn.com proposed by the new range guard
 
 Nothing in the product had ever checked whether an address belonged to a search
-engine. `bypass_rules.txt` held one static line for Googlebot, and DESIGN.md itself
-explains why that can never be enough: Google crawls from addresses outside any list
-Google publishes.
+engine. `bypass_rules.txt` held one static line for Googlebot and nothing consulted a
+second source, because there was no second source.
 
-Now implemented. Two directions, because one proves nothing:
+FCrDNS was implemented, worked, and was then removed inside the same release. The
+reason is worth writing down: a list of published ranges had existed since 1.0, and
+the case for reaching past it into runtime DNS was never actually made — the defect
+was that nothing consulted *either* source, not that the cheaper source was
+insufficient. Two hundred lines, a cache, a lookup budget and a clock were answering a
+question a file answers.
 
-    PTR      40.77.167.123  ->  msnbot-40-77-167-123.search.msn.com
-    forward  that hostname  ->  must resolve back to 40.77.167.123
+So: `/etc/logwall/crawler_ranges.txt`, 376 prefixes taken from the JSON the operators
+publish themselves — Googlebot (169 v4, 146 v6), bingbot (28 v4), Applebot (33 v4).
+Unlike the other data files it is REPLACED on every install: those hold operator
+decisions and must survive an upgrade, this one holds a copy of somebody else's
+published list, and a copy that never refreshes is the single failure mode a static
+list has.
 
-The PTR is published by whoever owns the address, so anyone can claim to be
-`msnbot-*.search.msn.com`. Only Microsoft can make that name resolve forward to an
-address they control — which is why a list of DOMAINS is safe here while a list of
-ranges is not. The domain list says who would be believed; the forward lookup is
-what proves it. Suffixes match on a dot boundary, so `evil-googlebot.com` does not
-pass as `googlebot.com`.
+The test for membership is whose cost it is. Blocking a search engine does not save
+bandwidth — it removes the site from search results, so the cost lands on the site
+owner. SEO tools, social preview fetchers, archives and AI training crawlers are
+deliberately absent: they consume bandwidth and send no visitors, and whether that
+trade is worth it belongs to whoever pays the bill. `bypass_rules.txt` is where an
+operator adds their own.
 
-Which crawlers are spared is a policy question, and the test is narrow: would
-blocking it cost the SITE OWNER something. A search engine that sends visitors is
-worth sparing even when it is expensive. An SEO tool, a social-media preview fetcher
-or an archive sends no visitors and costs bandwidth, so sparing it would be a
-decision made on the operator's behalf about their own bill. Those are recognised and
-named in the verdict — "blocked SemrushBot" and "blocked 185.191.171.10" are the same
-fact and not the same information — and they stay blockable.
+Google-Extended, GoogleOther and Google-InspectionTool are published in a separate
+"special crawlers" list and are NOT included — Google-Extended is Gemini training
+traffic, which is a bandwidth decision rather than a search-visibility one.
 
-The first version of that list got it wrong twice, and one was a hole rather than a
-preference: `googleusercontent.com` is the reverse-DNS suffix of Google Cloud
-CUSTOMER VMs, not of Googlebot. Protecting it would have handed permanent immunity to
-anyone willing to rent an instance — the exact population this product exists to
-block. It was caught by releasing four SemrushBot addresses on a host whose owner had
-just paid for extra bandwidth, which made the whole list worth re-reading.
+Stated limitations, because a static list has them:
 
-It is asked last, of a candidate that has already survived every cheaper guard, so
-lookups are spent on decisions rather than on requests. Results cache for thirty
-days. A DNS failure is deliberately NOT cached — a transient outage must not pin a
-real crawler as unverified for a month. Uncached lookups are capped per run, because
-a resolver that stops answering would otherwise turn a two-second run into a
-two-minute one, every two minutes, forever.
+  - It goes stale. preflight warns past `CRAWLER_RANGES_MAX_AGE_DAYS` (180), with the
+    URL to re-fetch from.
+  - **Yandex and Baidu publish no ranges at all.** Both document reverse DNS as the
+    only supported way to verify their crawlers, so this file cannot cover them. That
+    is the one thing FCrDNS did better, and it is the honest cost of this choice.
 
-The range guard consults it too, on the members that put the range on the list —
-four lookups rather than two hundred and fifty-six. So does the revalidation pass,
-and that took one more attempt to get right: ranges were being re-checked through
-`refusal_reason_network()`, which knows nothing about crawlers, while
-`_rotating_ranges()` skips any range already blocked. One /24 of
-msnbot-*.search.msn.com therefore survived five consecutive full revalidation passes,
-because nothing on either path ever looked at it again.
+DESIGN.md and README have been corrected rather than quietly adjusted: the section
+that specified FCrDNS now says what actually ships, and says that earlier revisions
+described a mechanism no release ever contained.
 
 ### Entries already blocked are now re-checked against the guards
 
-Guards only ever ran on candidates. An entry blocked before a guard existed — before
-a whitelist grew, before FCrDNS was written — stayed blocked forever with nothing
-left to review it. That is how 38 Bingbot addresses were still being enforced by a
+Guards only ever ran on candidates. An entry blocked before a guard existed — before a
+whitelist grew, before the crawler list shipped — stayed blocked forever with nothing
+left to review it. That is how 40 Bingbot addresses were still being enforced by a
 release that would never have blocked them.
 
 Every apply now re-checks the existing blacklist and releases what a guard refuses
-today, naming the guard.
-
-Every entry is verified, with no filter by verdict class — and the reason that
-sentence is here is that an earlier attempt did filter, on the reasoning that a
-crawler trips volume rules by crawling and would never ask for a source file. Field
-data killed it within the hour, twice:
-
-    40.77.167.20   blocked that same day as WebshellHunter. Bingbot follows stale
-                   links to .php pages and collects 404s doing it.
-    37 others      migrated from a retired blocker whose format had no reason field,
-                   so their recorded "class" is a date string and no filter could
-                   ever have matched it.
-
-There is no reliable signal for which entries deserve a lookup, and inventing one
-only decided which mistakes stayed in place longest.
-
-The lookup budget is a clock rather than a count, for the same reason. A count has to
-be tuned against a latency nobody knows in advance: measured on one host with a
-healthy resolver, 0.06s per lookup — a cap of 50 there left a 1,325-entry blacklist
-draining over 27 cycles for nothing, while on a host whose resolver had stopped
-answering the same 50 would have cost 150 seconds. A time budget needs no tuning — but it has to be started at the first lookup rather
-than when the object is built. Getting that wrong cost an evening: IPGuard is
-constructed before the log parse, so on a busy host the ten seconds were spent
-reading logs and the budget was gone before anything asked a question. The symptom
-was a run that managed two lookups and looked, from the outside, exactly like slow
-DNS. The budget and the cache carry
-this instead: one lookup per address per FCRDNS_CACHE_DAYS, so successive runs advance
-through a legacy list rather than re-walking it. At the default budget a 1,300-entry
-blacklist finishes inside a quarter of an hour of cycles. Cheap in the steady state: the other guards are list
-lookups, and FCrDNS has a budget and a cache, so a large legacy list drains over a
-few cycles rather than stalling one.
+today, naming the guard. The checks are list lookups, so checking everything costs
+nothing worth measuring — and an earlier attempt to check only *some* entries got it
+wrong twice, once because a crawler had been blocked as WebshellHunter for following
+stale .php links, and once because 37 entries migrated from a retired blocker had a
+date where their reason should have been.
 
 ### Deliberately NOT in this release
 
@@ -378,7 +346,7 @@ stays quiet, and on those hosts the intent class already carries everything — 
 
 ### Tests
 
-205 → 301 offline checks. Gate unchanged at 72.
+205 → 341 offline checks. Gate unchanged at 72.
 
 The false-positive case is a fixture, and it is verified to fail for the right
 reason: the signal fires (14 source-file 404s against a threshold of 2) and the veto

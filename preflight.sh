@@ -813,6 +813,29 @@ PYEOF
     fi
 
     check_peer_identity
+    check_crawler_ranges
+}
+
+# The search engine range list is static, so it goes stale: the operators add ranges
+# and this file does not learn about them. A stale list does not break anything, it
+# just stops sparing a crawler it used to spare — which shows up as a search engine
+# quietly disappearing from the site's traffic.
+check_crawler_ranges() {
+    local file="${CRAWLER_RANGES_FILE:-/etc/logwall/crawler_ranges.txt}"
+    local max_age="${CRAWLER_RANGES_MAX_AGE_DAYS:-180}"
+
+    if [ ! -r "$file" ]; then
+        pf_warn CRAWLER_RANGES_MISSING             "No search engine range list at ${file}; Googlebot and bingbot can be blocked by a volume rule, which costs search visibility rather than saving bandwidth."             "Reinstall to restore it, or set CRAWLER_RANGES_FILE to your own list."
+        return 0
+    fi
+
+    local age_days
+    age_days=$(( ( $(date +%s) - $(stat -c %Y "$file" 2>/dev/null || echo 0) ) / 86400 ))
+    if [ "$age_days" -gt "$max_age" ] 2>/dev/null; then
+        pf_warn CRAWLER_RANGES_STALE             "${file} is ${age_days} days old (limit ${max_age}). Search engines add ranges; a stale list stops sparing crawlers it used to spare."             "Re-fetch from the URLs in the file header, e.g. curl -s https://developers.google.com/static/search/apis/ipranges/googlebot.json"
+    else
+        pf_info CRAWLER_RANGES "Search engine range list is ${age_days} day(s) old." ""
+    fi
 }
 
 # Can the client address in the access log be believed at all?

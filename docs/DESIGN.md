@@ -23,7 +23,7 @@
 
 1. **Log- and byte-driven auto-blocker:** parses HTTP/HTTPS access logs (Nginx frontend/Apache) to detect brute force (`wp-login.php`), XML-RPC exploitation, sensitive-URL scanning (`.env`, `.sql`), request flooding, and **high bandwidth abuse (>30 MB)**.
 2. **Panel log auto-discovery:** maps each site's log location through the panel CLI (FastPanel CLI, for example) or falls back to pattern matching, with no hardcoded paths.
-3. **Identity-based bot blocking (aggressive crawler control):** uses `hash:net` sets keyed on User-Agent and attacker cloud ASN/CIDR ranges, with rDNS verification so Googlebot can bypass.
+3. **Identity-based bot blocking (aggressive crawler control):** uses `hash:net` sets keyed on User-Agent and attacker cloud ASN/CIDR ranges, and a shipped list of published search engine ranges so Googlebot is never blocked.
 4. **Port ↔ service synchronisation:** opens the ports running services need and closes orphaned ones.
 5. **L4 anti-DDoS and rate limiting:** kernel SYN cookie tuning (`sysctl`), conntrack rate limits, and dropping unknown UDP.
 6. **Dual protection & safe lockout:** a two-layer admin whitelist (ipset + a top-of-chain iptables rule), plus guaranteed availability of the public web ports (80/443 TCP and UDP QUIC) and DNS (53 TCP/UDP).
@@ -258,7 +258,6 @@ paths; without a panel it falls back to globbing `/var/www/*/data/logs/*.log`.
 │                           # ├── review_state.json   (Review items: NEW / PENDING / REVIEWED)
 │                           # ├── log_cursor.json     (Per-file inode & byte offset tracker, §16.2)
 │                           # ├── window_state.json   (IP hit counter state with TTL window)
-│                           # ├── rdns_cache.json     (FCrDNS bot verification cache, 30-day TTL)
 │                           # ├── trusted_history.json(Known-good IP history for escalation ladder)
 │                           # └── orphan_ports.json   (Consecutive orphan port cycle tracker)
 └── logs/                   # System operational logs & daily summaries (REPORT_RETENTION_DAYS)
@@ -336,7 +335,7 @@ NEW → PENDING_REVIEW → REVIEWED (through `logwall firewall ack <id>`)
 4. **Parse logs** → IP candidates against the thresholds (§10), using the cursor and the state
    window (§16.2), with real-IP resolution when behind a CDN or proxy (§8.F).
 5. **Filter candidates** — discard: the whitelist, the skip list, **CDN ranges (hard guard,
-   refused at any score)**, FCrDNS-verified bots, local/loopback/RFC1918 addresses, the server's
+   refused at any score)**, published search engine ranges, local/loopback/RFC1918 addresses, the server's
    own addresses, and the gateway and DNS resolvers the server uses; record the reason for every
    address (traceable).
 6. **Catch-up guard** — if this run ingested far more log than one interval covers, the
@@ -679,17 +678,26 @@ Policy summary:
 
 - Block by **UA + ASN/CIDR** (ipset hash:net) — bot addresses rotate, so per-address blocking is
   futile.
-- **FCrDNS verification (forward-confirmed reverse DNS)** before blocking a well-known bot —
-  rDNS alone can be forged by whoever owns the PTR, so both directions are required:
-  1. `IP → PTR` → the hostname must end in the official domain
-     (googlebot `*.googlebot.com` / `*.google.com`, bingbot `*.search.msn.com`,
-     baiduspider `*.baidu.com`, ahrefs `*.ahrefs.com`).
-  2. `hostname → A/AAAA` must return **the same address**. A mismatch means a forged UA → block.
-- Verification results are cached (`rdns_cache.json`, 30-day TTL) — never look up per request.
-- **DNS fail-safe:** resolver down or timing out → status `UNVERIFIED` → **do not block**; a
-  local DNS problem must never turn into an incident where Googlebot is blocked.
-- Note: `GOOGLE_BOT_NETS=66.249.64.0/19` is only a **fast-path cache**, not a complete list —
-  Google uses ranges outside it. FCrDNS remains the final authority.
+- **Search engines are spared from a shipped list of published ranges**
+  (`/etc/logwall/crawler_ranges.txt`): Googlebot, bingbot and Applebot, taken from the JSON
+  the operators publish themselves. Refreshed by every install, and preflight warns when the
+  file is older than `CRAWLER_RANGES_MAX_AGE_DAYS`.
+- The test for membership is **whose cost it is**. Blocking a search engine does not save
+  bandwidth; it removes the site from search results, so the cost lands on the site owner.
+  SEO tools, social preview fetchers, archives and AI training crawlers are deliberately
+  absent — they consume bandwidth and send no visitors, and whether that trade is worth it
+  belongs to whoever pays the bill. `bypass_rules.txt` is where an operator adds their own.
+- **Known limitations, because a static list has them:**
+  - It goes stale. Operators add ranges and the file does not learn.
+  - **Yandex and Baidu publish no ranges at all** — both document reverse DNS as the only
+    supported verification, so this file cannot cover them. Add addresses by hand if that
+    traffic matters to you.
+- Earlier revisions of this document specified FCrDNS (forward-confirmed reverse DNS) here,
+  with an `rdns_cache.json` and a 30-day TTL, and **no release ever implemented it**. It was
+  built in 1.0.0-rc13 and removed in the same release: it worked, but a published-range list
+  had existed since 1.0 and the case for reaching past it was never made. The defect it
+  exposed was not the mechanism — it was that nothing consulted *either* source, which is why
+  40 Bingbot addresses were found blocked on a production host.
 - The CIDR list is refreshed periodically (monthly cron, atomic swap) — cloud ranges change.
 - **Light bots** (Googlebot: cheap requests, cache-friendly) → leave alone.
 - **Heavy bots** (rendering crawlers such as BingPreview/Meta; persistent Ahrefs/Baidu) →

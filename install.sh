@@ -439,6 +439,16 @@ for datafile in whitelist_ips.txt blacklist_ips.txt bypass_rules.txt cdn_network
     fi
 done
 
+# The search engine range list is REPLACED on every install, unlike the files above.
+# Those hold operator decisions and must survive an upgrade; this one holds a copy of
+# what Google, Microsoft and Apple publish, and a copy that never refreshes is the
+# one failure mode a static list has. An operator's own exceptions belong in
+# bypass_rules.txt, which is why the two are separate files.
+if [ -f "${SCRIPT_DIR}/data/crawler_ranges.txt" ]; then
+    cp "${SCRIPT_DIR}/data/crawler_ranges.txt" "${CONF_DIR}/crawler_ranges.txt"
+    echo "[INFO]   search engine ranges refreshed ($(grep -cE '^[0-9a-fA-F]' "${CONF_DIR}/crawler_ranges.txt") prefixes)"
+fi
+
 # --- admin whitelist bootstrap -------------------------------------------------
 echo "[INFO]   bootstrapping admin whitelist..."
 ADMIN_IPS=""

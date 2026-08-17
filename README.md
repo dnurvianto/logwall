@@ -374,7 +374,8 @@ Deliberately outside 1.0, in order of intended arrival:
 1. **`sync-ports`** — port/service synchronisation. This is what would make logwall
    self-sufficient rather than a layer. It is also the most dangerous feature in
    the design, so it ships only with its full safety rails and a lot of testing.
-2. **Bot control** — User-Agent and ASN blocking with forward-confirmed reverse DNS.
+2. **Bot control** — User-Agent and ASN blocking. Search engines are spared from a
+   shipped list of the ranges Google, Microsoft and Apple publish themselves.
 3. **Layer-4 rate limiting** — SYN cookies and connection limits.
 4. **Geo-blocking** for administrative ports only.
 5. **Fleet sync** — sharing blocklists between your own servers.

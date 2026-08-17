@@ -302,7 +302,7 @@ class ApplyEngine:
         # Cheap in the steady state: the non-DNS guards are list lookups, and FCrDNS
         # has both a per-run budget and a thirty-day cache, so a large legacy list
         # drains over a few cycles instead of stalling one.
-        self.released = self._release_now_protected(entries, history)
+        self.released = self._release_now_protected(entries)
 
         # 4. Drop entries a wider accepted range already covers.
         #
@@ -328,7 +328,6 @@ class ApplyEngine:
         self.save_history(history)
         self.record_events(now)
         self.save_run_flags(now)
-        self.guard.save_verification_cache()
         self.report(entries, dry_run=False)
         return EXIT_OK, entries
 
@@ -361,29 +360,18 @@ class ApplyEngine:
         except OSError:
             pass
 
-    def _release_now_protected(self, entries, history=None):
+    def _release_now_protected(self, entries):
         """Removes entries the guards would refuse if proposed today."""
         if not get_bool(self.config, "REVALIDATE_BLACKLIST", True):
             return []
 
-        # Every entry is verified, with no filter by verdict class.
-        #
-        # An earlier version here skipped intent-class entries on the reasoning that
-        # a crawler trips volume rules by crawling and would never ask for a source
-        # file. Field data killed that within the hour, twice over:
-        #
-        #   40.77.167.20   blocked TODAY as WebshellHunter — Bingbot follows stale
-        #                  links to .php pages and collects 404s doing it
-        #   37 others      migrated from a retired blocker whose format had no
-        #                  reason field, so their "class" is a date string and no
-        #                  filter could ever have matched it
-        #
-        # So there is no reliable signal for which entries deserve a lookup, and
-        # inventing one only decided which mistakes stayed in place longest. The
-        # budget and the cache carry this instead: a lookup is spent once per
-        # address per FCRDNS_CACHE_DAYS, so successive runs advance through a legacy
-        # list rather than re-walking it. At the default budget a 1,300-entry
-        # blacklist finishes in about a quarter of an hour of cycles.
+        # Every entry is re-checked, with no filter and no ordering trick. An earlier
+        # version tried to guess which entries were worth checking and got it wrong
+        # twice — a crawler blocked as WebshellHunter for following stale .php links,
+        # and 37 entries migrated from a retired blocker whose format had no reason
+        # field at all. There is no reliable signal here, and inventing one only
+        # decided which mistakes stayed in place longest. The checks are list lookups,
+        # so checking everything costs nothing worth measuring.
         released = []
         for target in sorted(entries):
             if "/" in target:
@@ -394,18 +382,6 @@ class ApplyEngine:
                     target, get_int(self.config, "MAX_BLOCK_PREFIX_V4", 24),
                     get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
 
-                # Those rules know nothing about crawlers, and a range cannot be
-                # verified by enumerating it. So ask about the offenders that put it
-                # on the list, the same way the range was proposed in the first
-                # place. Without this a range blocked before verification existed
-                # stayed blocked forever: measured on a production host, one /24 of
-                # msnbot-*.search.msn.com survived five full revalidation passes
-                # because ranges took a code path that never looked.
-                if not refusal:
-                    ok, member, hostname = self.guard.verify_crawler_any(
-                        self._members_of(target, history))
-                    if ok:
-                        refusal = "VERIFIED_CRAWLER (%s via %s)" % (hostname, member)
             else:
                 refusal = self.guard.refusal_reason(target)
             if refusal:
@@ -415,23 +391,6 @@ class ApplyEngine:
             entries.pop(target, None)
         return released
 
-    def _members_of(self, cidr, history):
-        """Addresses in the offender history that fall inside this range."""
-        if not history:
-            return []
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-        except ValueError:
-            return []
-        members = []
-        for target in history:
-            try:
-                candidate = ipaddress.ip_network(target, strict=False)
-            except ValueError:
-                continue
-            if candidate.num_addresses == 1 and contained_in(candidate, net):
-                members.append(target)
-        return sorted(members)
 
     def _rotating_ranges(self, history, entries):
         """
@@ -512,20 +471,6 @@ class ApplyEngine:
                 continue
             signal = next(iter(group["classes"]))
 
-            # A range is not an attacker's just because several of its addresses
-            # tripped the same rule — a search engine crawls from many addresses in
-            # one /24 and trips volume rules doing it. Verified on a production
-            # host, where this guard proposed two /24s of msnbot-*.search.msn.com.
-            #
-            # The members that put the range on this list are exactly the addresses
-            # worth asking about, which is what makes verifying a range affordable:
-            # four lookups, not two hundred and fifty-six.
-            ok, member, hostname = self.guard.verify_crawler_any(
-                sorted(group["members"]))
-            if ok:
-                self.audit.refused[key] = "VERIFIED_CRAWLER (%s via %s)" % (
-                    hostname, member)
-                continue
 
             refusal = self.guard.refusal_reason_network(
                 key, v4_prefix, get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))

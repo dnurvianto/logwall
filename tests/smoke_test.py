@@ -2211,309 +2211,71 @@ check("py36: no Python 3.7+ API is used while preflight accepts 3.6",
       _offenders == [], _offenders)
 
 
-# ============================ FCrDNS: the guard docs promised and code never had
+# ======================== search engine crawlers: a shipped list, not a lookup
 #
-# Found by deploying: on a host with 1,336 blocked addresses, 38 were Bingbot, and
-# the range guard escalated that into proposing two whole /24s of
-# msnbot-*.search.msn.com. DESIGN.md had described FCrDNS since 1.0; lib/py
-# contained zero lines of it.
-#
-# Every case below uses an injected resolver. A test that needs DNS is a test that
-# gets skipped, and this is the guard standing between a search engine and a block.
-import fcrdns
+# FCrDNS lived here for one evening. It worked, and it was the wrong answer: a static
+# list of published ranges had existed since 1.0, and the reason to reach past it was
+# never demonstrated. What WAS demonstrated is that nothing consulted either one.
+repo_root = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ranges_file = os.path.join(repo_root, "conf", "crawler_ranges.txt")
+shipped = ip_guard.load_networks(ranges_file)
+check("crawlers: the shipped range file parses", len(shipped) > 200, len(shipped))
 
-FAKE = {
-    # a real crawler: PTR matches a crawler domain AND resolves back
-    "40.77.167.123": ("msnbot-40-77-167-123.search.msn.com",
-                      {"40.77.167.123"}, False),
-    "66.249.66.1":   ("crawl-66-249-66-1.googlebot.com", {"66.249.66.1"}, False),
-    # PTR claims a crawler but the name resolves somewhere else: a forgery
-    "45.33.32.156":  ("crawl-fake.googlebot.com", {"1.2.3.4"}, False),
-    # PTR is a lookalike domain
-    "45.33.32.157":  ("bot.evil-googlebot.com", {"45.33.32.157"}, False),
-    # honest non-crawler
-    "20.65.105.233": ("scanner.example.net", {"20.65.105.233"}, False),
-    # no PTR at all
-    "203.0.113.240": (None, set(), False),
-    # resolver did not answer
-    "203.0.113.241": (None, set(), True),
-}
+crawl_cfg = dict(cfg)
+crawl_cfg["STATE_DIR"] = steady(os.path.join(work, "state_crawl"))
+crawl_cfg["CRAWLER_RANGES_FILE"] = ranges_file
+cguard = ip_guard.IPGuard(crawl_cfg)
 
+# 66.249.64.0/19 is in the test fixture's bypass list, so it would be refused for
+# the wrong reason; 192.178.4.0/27 is Googlebot too and only in the shipped list.
+check("crawlers: a Googlebot address is refused",
+      cguard.refusal_reason("192.178.4.1") == "SEARCH_ENGINE",
+      cguard.refusal_reason("192.178.4.1"))
+check("crawlers: a bingbot address is refused",
+      cguard.refusal_reason("157.55.39.1") == "SEARCH_ENGINE",
+      cguard.refusal_reason("157.55.39.1"))
+check("crawlers: an Applebot address is refused",
+      cguard.refusal_reason("17.241.208.161") == "SEARCH_ENGINE",
+      cguard.refusal_reason("17.241.208.161"))
+check("crawlers: an ordinary attacker is still blockable",
+      cguard.refusal_reason("20.65.105.233") is None,
+      cguard.refusal_reason("20.65.105.233"))
+check("crawlers: a range OVERLAPPING a crawler range is refused whole",
+      cguard.refusal_reason_network("192.178.4.0/24") == "SEARCH_ENGINE",
+      cguard.refusal_reason_network("192.178.4.0/24"))
 
-def fake_resolver(ip, timeout):
-    return FAKE.get(ip, (None, set(), False))
+# the policy the list encodes, stated as a test so it cannot drift silently
+body = open(ranges_file, encoding="utf-8").read()
+for absent in ("semrush", "ahrefs", "bytespider", "openai", "anthropic"):
+    check("crawlers: %s is NOT in the shipped list" % absent,
+          absent not in body.lower())
+check("crawlers: the file says Yandex and Baidu publish no ranges",
+      "Yandex" in body and "Baidu" in body)
+check("crawlers: and says the list goes stale",
+      "goes stale" in body)
 
-
-def verifier(name, **kw):
-    st = os.path.join(work, "state_" + name)
-    os.makedirs(st, exist_ok=True)
-    return fcrdns.FCrDNS(st, resolver=fake_resolver, **kw)
-
-fv = verifier("fc1")
-check("fcrdns: a genuine Bingbot address verifies",
-      fv.verify("40.77.167.123")[0], fv.verify("40.77.167.123"))
-check("fcrdns: a genuine Googlebot address verifies",
-      fv.verify("66.249.66.1")[0])
-check("fcrdns: a PTR that does not resolve BACK is rejected",
-      not fv.verify("45.33.32.156")[0], fv.verify("45.33.32.156"))
-check("fcrdns: a lookalike domain is rejected on the dot boundary",
-      not fv.verify("45.33.32.157")[0], fv.verify("45.33.32.157"))
-check("fcrdns: an honest non-crawler is simply not verified",
-      not fv.verify("20.65.105.233")[0])
-check("fcrdns: no PTR means not verified",
-      not fv.verify("203.0.113.240")[0])
-
-# a resolver outage must not pin a real crawler as unverified for 30 days
-fo = verifier("fc2")
-check("fcrdns: a resolver failure is not verified",
-      not fo.verify("203.0.113.241")[0])
-check("fcrdns: and is NOT cached, so an outage decides nothing for a month",
-      "203.0.113.241" not in fo.cache, fo.cache)
-check("fcrdns: while a real answer IS cached",
-      fo.verify("40.77.167.123")[0] and "40.77.167.123" in fo.cache)
-
-# the cache survives a run and costs no lookups the second time
-fo.save()
-fc = fcrdns.FCrDNS(fo.state_dir, resolver=fake_resolver)
-check("fcrdns: the cache is reloaded from disk",
-      fc.verify("40.77.167.123")[0] and fc.lookups == 0, fc.lookups)
-
-# a broken resolver cannot stall a run: the CLOCK is the real budget
-slow_calls = []
-
-
-def slow_resolver(ip, timeout):
-    slow_calls.append(ip)
-    time.sleep(0.4)
-    return None, set(), True          # resolver never answers
-
-
-ft = fcrdns.FCrDNS(os.path.join(work, "state_fc_time"), resolver=slow_resolver,
-                   max_lookups=1000, max_seconds=1)
-os.makedirs(ft.state_dir, exist_ok=True)
-for n in range(40):
-    ft.verify("198.51.100.%d" % n)
-# the clock must start at the first LOOKUP, not when the object was built
-lazy = fcrdns.FCrDNS(os.path.join(work, "state_fc_lazy"), resolver=fake_resolver,
-                     max_lookups=1000, max_seconds=2)
-os.makedirs(lazy.state_dir, exist_ok=True)
-check("fcrdns: the clock has not started before the first lookup",
-      lazy.started is None)
-time.sleep(2.2)                     # as if a log parse had taken the whole budget
-check("fcrdns: a lookup after a long parse still gets its budget",
-      lazy.verify("40.77.167.123")[0] and not lazy.exhausted,
-      (lazy.lookups, lazy.exhausted))
-
-check("fcrdns: a dead resolver is cut off by the time budget, not by a count",
-      ft.exhausted and ft.lookups <= 4, (ft.lookups, ft.exhausted))
-check("fcrdns: so a stalled run costs about the budget, not 40 timeouts",
-      len(slow_calls) <= 4, len(slow_calls))
-
-# and a fast resolver is allowed to get through plenty inside the same budget
-ff = fcrdns.FCrDNS(os.path.join(work, "state_fc_fast"), resolver=fake_resolver,
-                   max_lookups=1000, max_seconds=5)
-os.makedirs(ff.state_dir, exist_ok=True)
-for n in range(200):
-    ff.verify("198.51.100.%d" % n)
-check("fcrdns: a healthy resolver spends the same budget on hundreds of lookups",
-      ff.lookups == 200 and not ff.exhausted, (ff.lookups, ff.exhausted))
-
-# the count remains a second ceiling
-fb = verifier("fc3", max_lookups=2)
-for n in range(6):
-    fb.verify("198.51.100.%d" % n)
-check("fcrdns: uncached lookups are capped per run", fb.lookups == 2, fb.lookups)
-check("fcrdns: and the run says the budget ran out", fb.exhausted)
-
-# switched off means never consulted
-check("fcrdns: it can be switched off entirely",
-      not verifier("fc4", enabled=False).verify("40.77.167.123")[0])
-
-# the domain matcher on its own
-check("fcrdns: exact domain matches", fcrdns._matches_crawler_domain("google.com"))
-check("fcrdns: subdomain matches",
-      fcrdns._matches_crawler_domain("crawl-1.googlebot.com"))
-check("fcrdns: a suffix without a dot boundary does NOT match",
-      fcrdns._matches_crawler_domain("evilgooglebot.com") is None)
-check("fcrdns: a trailing dot is tolerated",
-      fcrdns._matches_crawler_domain("crawl.googlebot.com."))
-check("fcrdns: empty is not a match", fcrdns._matches_crawler_domain("") is None)
-
-# --- who is spared is a POLICY question, and it is narrow --------------------
-#
-# The test for membership is whether blocking would cost the SITE OWNER something.
-# A search engine that sends visitors is worth sparing even when it is expensive; a
-# scraper that consumes bandwidth and returns nothing is not, and the operator who
-# paid that bill is entitled to block it.
-for host in ("crawl-66-249-66-1.googlebot.com",
-             "msnbot-40-77-167-1.search.msn.com",
-             "crawl-1.duckduckgo.com",
-             "spider-5-45-207-1.yandex.com",
-             "baiduspider-1.crawl.baidu.com"):
-    check("policy: %s is spared" % host.split(".", 1)[1],
-          fcrdns._matches_crawler_domain(host) is not None, host)
-
-for host in ("bot-185-191-171-1.semrush.com", "crawl-1.ahrefs.com",
-             "fetcher.facebook.com", "ia-archiver.archive.org"):
-    check("policy: %s is recognised but still blockable" % host.split(".", 1)[1],
-          fcrdns._matches_crawler_domain(host) is None
-          and fcrdns.identify_crawler(host) is not None, host)
-
-# the hole that mattered most: Google Cloud customer VMs are NOT Googlebot
-check("policy: googleusercontent.com is NOT spared — those are rented VMs",
-      fcrdns._matches_crawler_domain("1-2-3-4.bc.googleusercontent.com") is None)
-
-# --- the guard refuses a verified crawler, and says why ----------------------
-gcfg = dict(cfg)
-gcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcguard"))
-fguard = ip_guard.IPGuard(gcfg, resolver=fake_resolver)
-check("guard: a verified crawler is refused for blocking",
-      fguard.refusal_reason("40.77.167.123") == "VERIFIED_CRAWLER",
-      fguard.refusal_reason("40.77.167.123"))
-check("guard: and the hostname that proved it is kept for the report",
-      "search.msn.com" in (fguard.verified_hosts.get("40.77.167.123") or ""),
-      fguard.verified_hosts)
-check("guard: a forged crawler claim is still blockable",
-      fguard.refusal_reason("45.33.32.156") is None,
-      fguard.refusal_reason("45.33.32.156"))
-check("guard: an ordinary attacker is still blockable",
-      fguard.refusal_reason("20.65.105.233") is None)
-
-# --- and the rotation guard must not propose a crawler's range ---------------
-bing_hist = dict(("40.77.167.%d" % n, {"strike": 1, "last": int(time.time()),
-                                       "class": "CloudScraper"})
-                 for n in (123, 3, 60, 76))
-rcfg = dict(cfg)
-rcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcrot"))
-rcfg["BLACKLIST"] = os.path.join(work, "blacklist_fcrot.txt")
-with open(os.path.join(rcfg["STATE_DIR"], "offender_history.json"), "w",
-          encoding="utf-8") as fh:
-    json.dump(bing_hist, fh)
-reng = apply_engine.ApplyEngine(rcfg)
-reng.guard = reng.audit.guard = ip_guard.IPGuard(rcfg, resolver=fake_resolver)
-reng.audit.evaluate_candidates = lambda panel=None: {}
-_, rent = reng.execute(dry_run=False)
-check("rotation: a range holding a verified crawler is NOT blocked",
-      "40.77.167.0/24" not in rent, sorted(t for t in rent if "/" in t))
-check("rotation: and the refusal names the crawler that proved it",
-      any("search.msn.com" in str(v) for v in reng.audit.refused.values()),
-      reng.audit.refused)
-
-# while a range of genuine offenders is still blocked
-bad_hist = dict(("20.65.105.%d" % n, {"strike": 1, "last": int(time.time()),
-                                      "class": "CloudScraper"})
-                for n in (233, 234, 235, 236))
-bcfg = dict(cfg)
-bcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcrot2"))
-bcfg["BLACKLIST"] = os.path.join(work, "blacklist_fcrot2.txt")
-with open(os.path.join(bcfg["STATE_DIR"], "offender_history.json"), "w",
-          encoding="utf-8") as fh:
-    json.dump(bad_hist, fh)
-beng = apply_engine.ApplyEngine(bcfg)
-beng.guard = beng.audit.guard = ip_guard.IPGuard(bcfg, resolver=fake_resolver)
-beng.audit.evaluate_candidates = lambda panel=None: {}
-_, bent = beng.execute(dry_run=False)
-check("rotation: a range with no verified crawler is still blocked",
-      "20.65.105.0/24" in bent, sorted(t for t in bent if "/" in t))
-
-
-# ============ revalidation verifies EVERY entry, and progress survives the budget
-#
-# An earlier version skipped intent-class entries, reasoning that a crawler trips
-# volume rules by crawling and would never ask for a source file. Field data killed
-# that within the hour: Bingbot was blocked as WebshellHunter for following stale
-# links to .php pages, and 37 more Bing entries had been migrated from a retired
-# blocker whose format had no reason field at all — their "class" is a date string.
-ord_state = steady(os.path.join(work, "state_revord"))
-ord_cfg = dict(cfg)
-ord_cfg["STATE_DIR"] = ord_state
-ord_cfg["BLACKLIST"] = os.path.join(work, "blacklist_revord.txt")
-ord_cfg["FCRDNS_MAX_LOOKUPS_PER_RUN"] = "4"
-with open(ord_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
-    for n in range(1, 7):
-        fh.write("100.26.122.%d    # 2026-08-16 01:00 | ReconScanner | PERMANENT | "
-                 "strike=1 | expires=-\n" % n)
-    # blocked as an INTENT class, and still a real crawler
-    fh.write("40.77.167.123    # 2026-08-16 01:00 | WebshellHunter | PERMANENT | "
+# a blacklist entry inside a crawler range is released on the next apply
+crel_state = steady(os.path.join(work, "state_crawlrel"))
+crel_cfg = dict(cfg)
+crel_cfg["STATE_DIR"] = crel_state
+crel_cfg["CRAWLER_RANGES_FILE"] = ranges_file
+crel_cfg["BLACKLIST"] = os.path.join(work, "blacklist_crawlrel.txt")
+with open(crel_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
+    fh.write("157.55.39.10    # 2026-08-14 08:30 | CloudScraper | PERMANENT | "
              "strike=1 | expires=-\n")
-    # migrated from a blocker with no reason field: the class is a date
-    fh.write("66.249.66.1    # 2026-08-14 08:30 | 2026-07-31 00:10 | PERMANENT | "
+    fh.write("20.65.105.233    # 2026-08-14 08:30 | CloudScraper | PERMANENT | "
              "strike=1 | expires=-\n")
+crel = apply_engine.ApplyEngine(crel_cfg)
+crel.audit.evaluate_candidates = lambda panel=None: {}
+_, crel_entries = crel.execute(dry_run=False)
+check("crawlers: a bingbot address already on the blacklist is released",
+      "157.55.39.10" not in crel_entries, sorted(crel_entries))
+check("crawlers: named as the guard that refused it",
+      any(r == "SEARCH_ENGINE" for _t, r in crel.released), crel.released)
+check("crawlers: and the genuine offender stays blocked",
+      "20.65.105.233" in crel_entries, sorted(crel_entries))
 
-
-def revalidate(cfg_in):
-    eng = apply_engine.ApplyEngine(cfg_in)
-    eng.guard = eng.audit.guard = ip_guard.IPGuard(cfg_in, resolver=fake_resolver)
-    eng.audit.evaluate_candidates = lambda panel=None: {}
-    return eng, eng.execute(dry_run=False)[1]
-
-# run 1: the budget runs out before reaching either crawler (both sort late)
-e1, ent1 = revalidate(ord_cfg)
-check("revalidate: a small budget is spent and reported as exhausted",
-      e1.guard.fcrdns.lookups == 4 and e1.guard.fcrdns.exhausted,
-      (e1.guard.fcrdns.lookups, e1.guard.fcrdns.exhausted))
-
-# run 2 continues from the cache rather than re-walking the same addresses
-e2, ent2 = revalidate(ord_cfg)
-check("revalidate: the second run advances instead of repeating the first",
-      "40.77.167.123" not in ent2 or "66.249.66.1" not in ent2,
-      sorted(ent2))
-
-# by run 3 both crawlers are verified and released, whatever their verdict class
-e3, ent3 = revalidate(ord_cfg)
-check("revalidate: an INTENT-class entry that is really a crawler gets released",
-      "40.77.167.123" not in ent3, sorted(ent3))
-check("revalidate: so does one migrated with a date where its reason should be",
-      "66.249.66.1" not in ent3, sorted(ent3))
-check("revalidate: named as the crawler guard",
-      any(r == "VERIFIED_CRAWLER" for _t, r in e1.released + e2.released + e3.released)
-      or True, [e1.released, e2.released, e3.released])
-check("revalidate: and the genuine offenders all stay blocked",
-      sum(1 for t in ent3 if t.startswith("100.26.122.")) == 6,
-      sorted(t for t in ent3 if t.startswith("100.")))
-
-
-# ============ a RANGE blocked before verification existed must also be released
-#
-# Measured on a production host: one /24 of msnbot-*.search.msn.com survived five
-# full revalidation passes, because ranges went through refusal_reason_network()
-# which knows nothing about crawlers, and _rotating_ranges() skips a range that is
-# already blocked. Nothing ever looked at it again.
-rr_state = steady(os.path.join(work, "state_revrange"))
-rr_cfg = dict(cfg)
-rr_cfg["STATE_DIR"] = rr_state
-rr_cfg["BLACKLIST"] = os.path.join(work, "blacklist_revrange.txt")
-with open(rr_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
-    fh.write("40.77.167.0/24    # 2026-08-17 19:36 | RotatingOffender | TEMP | "
-             "strike=1 | expires=%d\n" % (int(time.time()) + 86400))
-    fh.write("20.65.105.0/24    # 2026-08-17 19:36 | RotatingOffender | TEMP | "
-             "strike=1 | expires=%d\n" % (int(time.time()) + 86400))
-with open(os.path.join(rr_state, "offender_history.json"), "w",
-          encoding="utf-8") as fh:
-    hist = {"40.77.167.123": {"strike": 1, "last": int(time.time()),
-                              "class": "CloudScraper"},
-            "20.65.105.233": {"strike": 1, "last": int(time.time()),
-                              "class": "CloudScraper"}}
-    json.dump(hist, fh)
-
-rr_engine = apply_engine.ApplyEngine(rr_cfg)
-rr_engine.guard = rr_engine.audit.guard = ip_guard.IPGuard(
-    rr_cfg, resolver=fake_resolver)
-rr_engine.audit.evaluate_candidates = lambda panel=None: {}
-_, rr_entries = rr_engine.execute(dry_run=False)
-
-check("revalidate: a RANGE holding a verified crawler is released",
-      "40.77.167.0/24" not in rr_entries, sorted(rr_entries))
-check("revalidate: and the release names the crawler and the member that proved it",
-      any("search.msn.com" in r and "40.77.167.123" in r
-          for _t, r in rr_engine.released), rr_engine.released)
-check("revalidate: a range of genuine offenders stays blocked",
-      "20.65.105.0/24" in rr_entries, sorted(rr_entries))
-check("revalidate: members are found from history, not by enumerating 256 addresses",
-      rr_engine._members_of("40.77.167.0/24", hist) == ["40.77.167.123"],
-      rr_engine._members_of("40.77.167.0/24", hist))
-check("revalidate: a range with no history members asks nothing",
-      rr_engine._members_of("203.0.113.0/24", hist) == [])
 
 
 print()
