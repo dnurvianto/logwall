@@ -26,7 +26,8 @@ from config_loader import get_bool, get_int, get_path
 from ip_guard import is_unroutable_source, parse_ip
 
 METRIC_KEYS = ("hits", "wp", "xmlrpc", "scan", "bw", "p401", "auth",
-               "pages", "assets", "sua", "p404", "aua", "lpost")
+               "pages", "assets", "sua", "p404", "aua", "lpost",
+               "src404", "ok")
 
 # Static resources a browser fetches on its own after receiving a page.
 #
@@ -355,6 +356,10 @@ class TrafficWindow:
         floor = newest - count
         return [metrics for index, metrics in buckets.items() if index > floor]
 
+    def intent_minutes(self):
+        """The sliding intent window, in minutes, as actually bucketed."""
+        return (self.intent_buckets * self.interval) // 60
+
     def intent_sum(self, metric):
         """Total over the intent window. For signals whose base rate is zero."""
         out = {}
@@ -525,6 +530,26 @@ class LogParserEngine:
             r"\.DS_Store|config\.json|\.npmrc|\.dockercfg|docker-compose\.ya?ml|"
             r"/phpinfo|/adminer|\.old$|\.orig$",
             re.IGNORECASE)
+
+        # A request for a SOURCE file that returned 404.
+        #
+        # 404 on a page is ordinary — a dead link, a stale search-engine index.
+        # 404 on a source file has no innocent reading: visitors and crawlers
+        # follow links, and nothing links to /dvoqqmkm.php. Measured on a busy
+        # government site, 636k requests: 73 source-file 404s against 1,345 page
+        # 404s, and all 19 addresses responsible were hostile.
+        #
+        # `wp-login.php` and `xmlrpc.php` are excluded on purpose — both already
+        # have dedicated rules, and counting them here would punish twice for one
+        # act. On the same host six addresses in one /24 each asked for
+        # wp-login.php exactly once; this exclusion is what spares them.
+        self.source_file_pattern = re.compile(
+            self.config.get("SOURCE_FILE_EXTENSIONS")
+            or r"\.(?:php|phtml|php[0-9]|asp|aspx|jsp|jspx|cgi|pl|py|rb|sh|"
+               r"env|sql|bak|inc|ini|conf|yml|yaml|pem|key)$",
+            re.IGNORECASE)
+        self.source_file_exempt = re.compile(
+            r"wp-login\.php$|xmlrpc\.php$", re.IGNORECASE)
 
         # Login endpoints outside WordPress. Kept configurable because every
         # framework names its own, and a wrong guess here punishes real users
@@ -1061,6 +1086,17 @@ class LogParserEngine:
                     self.window.add(ip, "p401", 1, stamp)
                 if status == 404:
                     self.window.add(ip, "p404", 1, stamp)
+                    path = uri.split("?", 1)[0].split("#", 1)[0]
+                    if (self.source_file_pattern.search(path)
+                            and not self.source_file_exempt.search(path)):
+                        self.window.add(ip, "src404", 1, stamp)
+
+                # Evidence that this client is a client: it got something back.
+                # A dictionary sweeper collects nothing but 404s, so a successful
+                # response is one of the two things that separate a real visitor
+                # from a scanner (the other is fetching assets).
+                elif status in (200, 201, 204, 206, 301, 302, 304):
+                    self.window.add(ip, "ok", 1, stamp)
 
                 # Only POST counts. A GET of /login is the login PAGE; a POST is
                 # an attempt, and counting page views would flag every visitor
@@ -1098,4 +1134,6 @@ class LogParserEngine:
             "bw": self.window.intent_sum("bw"),
             "panel_404": self.window.intent_sum("p404"),
             "login_post": self.window.intent_sum("lpost"),
+            "source_404": self.window.intent_sum("src404"),
+            "ok": self.window.intent_sum("ok"),
         }

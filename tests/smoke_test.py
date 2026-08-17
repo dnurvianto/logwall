@@ -1586,6 +1586,157 @@ check("identity: dead settings are gone from the shipped config",
                        "..", "conf", "logwall.conf"), encoding="utf-8").read())
 
 
+# ============================================================== rc13 Fase 3
+#
+# Both halves of this phase come from the same day of field measurement, and the
+# false-positive case is the one that matters: it exists on exactly one host in
+# the fleet, and the threshold that "looked safe" on the busiest host would have
+# blocked five real people on it.
+
+
+def sweeper_log(name, ip, paths, status=404):
+    """A dictionary sweep: many distinct source-file paths, nothing but 404s."""
+    path = write(name, "")
+    with open(path, "a", encoding="utf-8") as handle:
+        for target in paths:
+            handle.write('%s - - [%s] "GET %s HTTP/1.1" %d 120 "-" "Mozilla/5.0"\n'
+                         % (ip, stamp_now(), target, status))
+    return path
+
+
+def audit_for(name, log, extra=None):
+    local = dict(cfg)
+    local["STATE_DIR"] = steady(os.path.join(work, "state_" + name))
+    if extra:
+        local.update(extra)
+    engine = audit_engine.AuditEngine(local)
+    engine.parser.discover_log_files = lambda panel=None: [log]
+    engine.parser.discover_auth_logs = lambda: []
+    return engine, engine.evaluate_candidates()
+
+# --- R8: the webshell hunter that walked free for a day -----------------------
+shells = ["/fff.php", "/zz.php", "/xx.php", "/1.php", "/sf.php", "/222.php",
+          "/wp-blog.php", "/wp-good.php", "/this_is_a_new_hello_world.php",
+          "/wp-content/plugins/hellopress/wp_filemanager.php"]
+hunter_log = sweeper_log("hunter.log", "20.65.105.233", shells)
+hunter_engine, hunter = audit_for("hunter", hunter_log)
+check("webshell: a source-file sweep is caught",
+      "20.65.105.233" in hunter, sorted(hunter))
+check("webshell: named for what it is, and permanently",
+      hunter.get("20.65.105.233", {}).get("tier") == "PERMANENT"
+      and "WebshellHunter" in hunter.get("20.65.105.233", {}).get("reason", ""),
+      hunter.get("20.65.105.233"))
+check("webshell: the reason states how many source files it asked for",
+      "10x" in hunter.get("20.65.105.233", {}).get("reason", ""),
+      hunter.get("20.65.105.233", {}).get("reason"))
+
+# --- R8: a per-interval 404 threshold could never have seen it ----------------
+peak_404 = max((hunter_engine.parser.window.peak("p404") or {}).values(), default=0)
+check("webshell: it never came close to the per-interval 404 threshold",
+      peak_404 < 30, peak_404)
+
+# --- R8: wp-login and xmlrpc must not be counted twice ------------------------
+dbl_log = sweeper_log("double.log", "45.33.32.170",
+                      ["/wp-login.php", "/xmlrpc.php"] * 6)
+_, dbl = audit_for("double", dbl_log)
+reason = dbl.get("45.33.32.170", {}).get("reason", "")
+check("webshell: wp-login/xmlrpc are left to their own rules",
+      "WebshellHunter" not in reason, reason)
+
+# --- R8: THE false positive. A real visitor asking for a removed plugin file ---
+#
+# Measured on a WordPress host: five visitors on phones kept requesting
+# /wp-content/plugins/screenreader/libraries/tts/proxy.php after the accessibility
+# plugin was removed. One asked 14 times — more than nine of the sixteen genuine
+# sweepers on that same host. Any threshold on the COUNT is either blind or cruel.
+missing_plugin = "/wp-content/plugins/screenreader/libraries/tts/proxy.php"
+visitor_log = write("visitor.log", "")
+with open(visitor_log, "a", encoding="utf-8") as handle:
+    for _ in range(14):
+        handle.write('114.122.138.128 - - [%s] "GET %s HTTP/1.1" 404 120 "-" '
+                     '"Mozilla/5.0 (Linux; Android 10; K)"\n'
+                     % (stamp_now(), missing_plugin))
+    for n in range(47):
+        handle.write('114.122.138.128 - - [%s] "GET /wp-content/themes/x/s%d.css '
+                     'HTTP/1.1" 200 900 "-" "Mozilla/5.0 (Linux; Android 10; K)"\n'
+                     % (stamp_now(), n))
+    for n in range(58):
+        handle.write('114.122.138.128 - - [%s] "GET /berita/%d/ HTTP/1.1" 200 20000 '
+                     '"-" "Mozilla/5.0 (Linux; Android 10; K)"\n' % (stamp_now(), n))
+_, visitor = audit_for("visitor", visitor_log)
+check("visitor: 14 source-file 404s from a REAL visitor is not a block",
+      "114.122.138.128" not in visitor, sorted(visitor))
+
+# and the count alone would have convicted them
+check("visitor: which the count alone would not have prevented",
+      14 >= 2, 14)
+
+# --- R8: the client-evidence veto, both halves --------------------------------
+ev_metrics = {"ok": {"a": 5, "b": 0, "c": 0},
+              "assets": {"a": 0, "b": 40, "c": 0},
+              "pages": {"a": 0, "b": 60, "c": 90}}
+ev_engine = audit_engine.AuditEngine(dict(cfg))
+check("evidence: successful responses alone prove a client",
+      ev_engine._looks_like_a_client("a", ev_metrics))
+check("evidence: fetching assets alone proves a client",
+      ev_engine._looks_like_a_client("b", ev_metrics))
+check("evidence: neither assets nor successes is a sweeper",
+      not ev_engine._looks_like_a_client("c", ev_metrics))
+check("evidence: an unseen address is not given the benefit of the doubt",
+      not ev_engine._looks_like_a_client("zzz", ev_metrics))
+
+# --- R6: PathBruteForce catches a single-burst sweep --------------------------
+burst = ["/admin%d/" % n for n in range(60)]
+burst_log = sweeper_log("burst.log", "185.9.186.245", burst)
+_, burst_v = audit_for("burst", burst_log)
+check("pathbrute: a sweep finished inside one burst is caught",
+      "185.9.186.245" in burst_v, sorted(burst_v))
+check("pathbrute: over the intent window, not per interval",
+      "in 30m" in " ".join(m["reason"] for m in burst_v.values()),
+      [m["reason"] for m in burst_v.values()])
+
+# --- R6: and a visitor hitting a broken theme is still spared -----------------
+broken_log = write("broken.log", "")
+with open(broken_log, "a", encoding="utf-8") as handle:
+    for n in range(50):
+        handle.write('182.8.225.43 - - [%s] "GET /wp-content/themes/x/gone%d.css '
+                     'HTTP/1.1" 404 0 "-" "Mozilla/5.0"\n' % (stamp_now(), n))
+    for n in range(120):
+        handle.write('182.8.225.43 - - [%s] "GET /artikel/%d/ HTTP/1.1" 200 18000 '
+                     '"-" "Mozilla/5.0"\n' % (stamp_now(), n))
+_, broken = audit_for("broken", broken_log)
+check("pathbrute: a visitor served 404s by a broken theme is not blocked",
+      "182.8.225.43" not in broken, sorted(broken))
+
+# --- R4: profiling survives a mixed-vhost host -------------------------------
+#
+# One asset-free application beside one ordinary site. Pooled asset ratio is far
+# below SITE_ASSET_RATIO_MIN, but several individual clients clearly fetch assets,
+# so the signal is usable and must not switch itself off.
+mixed = {"pages": {}, "assets": {}}
+for n in range(400):                       # the case-tracking app: no assets at all
+    mixed["pages"]["10.9.%d.%d" % (n // 250, n % 250)] = 40
+for n in range(5):                         # ordinary visitors on the other vhost
+    mixed["pages"]["203.0.113.%d" % (n + 20)] = 40
+    mixed["assets"]["203.0.113.%d" % (n + 20)] = 60
+mixed_engine = audit_engine.AuditEngine(dict(cfg))
+mixed_engine._calibrate_client_profiling(mixed)
+check("profiling: a pooled ratio below the floor does not switch it off alone",
+      mixed_engine.site_ratio < 0.40, round(mixed_engine.site_ratio, 3))
+check("profiling: because five clients demonstrably fetched assets",
+      mixed_engine.profile_witnesses >= 3, mixed_engine.profile_witnesses)
+check("profiling: so it stays enabled", mixed_engine.profiling is True)
+
+# --- R4: a genuine CDN host must still disable it ----------------------------
+cdn_only = {"pages": {"203.0.113.%d" % n: 40 for n in range(10)}, "assets": {}}
+cdn_engine = audit_engine.AuditEngine(dict(cfg))
+cdn_engine._calibrate_client_profiling(cdn_only)
+check("profiling: with nobody fetching assets it still disables itself",
+      cdn_engine.profiling is False)
+check("profiling: and the message says how many clients were checked",
+      "client(s) of" in (cdn_engine.flags_extra or ""), cdn_engine.flags_extra)
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

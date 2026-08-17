@@ -155,6 +155,35 @@ class AuditEngine:
                 consider(ip, f"ToolSignature | offensive scanner UA | Hits: {count}x",
                          TIER_PERMANENT)
 
+        # Dictionary sweepers hunting for a webshell somebody else already planted.
+        #
+        # Four of these walked free on a production host for a full day: 170, 117,
+        # 50 and 47 requests each, every one a 404, none of them blocked. They
+        # escaped every existing rule at once — no scanner UA, random .php names
+        # absent from the sensitive-file list, xmlrpc touched once, and 404 counted
+        # as VOLUME at 30 per interval while they spread 170 requests over 12 hours.
+        #
+        # A 404 on a page is ordinary. A 404 on a SOURCE file is not: visitors and
+        # crawlers follow links, and nothing links to /dvoqqmkm.php.
+        #
+        # The count alone cannot carry this, and that is the part worth remembering.
+        # On a WordPress host that had removed an accessibility plugin, five real
+        # visitors on phones kept asking for a file that no longer existed — one of
+        # them 14 times, more than nine of the sixteen genuine sweepers on the same
+        # host. Any threshold on the number is either blind or cruel.
+        #
+        # What separates them is whether the address behaves like a client at all:
+        # sweepers fetched zero assets and collected at most one success, while
+        # every real visitor pulled 39-81% assets and 29-167 successes.
+        threshold_src404 = get_int(self.config, "THRESHOLD_SOURCE_404", 2)
+        for ip, count in metrics.get("source_404", {}).items():
+            if count < threshold_src404:
+                continue
+            if self._looks_like_a_client(ip, metrics):
+                continue
+            consider(ip, f"WebshellHunter | source-file 404s: {count}x",
+                     TIER_PERMANENT)
+
         # Intent that stayed under every individual threshold but is unmistakable
         # once added up. The /24 rollup has summed these four since 1.0; a single
         # address was judged more leniently than its own neighbours until now.
@@ -179,23 +208,37 @@ class AuditEngine:
         # this rule would convict the victims of the operator's own bug.
         threshold_404 = get_int(self.config, "THRESHOLD_404_PER_INTERVAL", 30)
         ratio_404_min = float(self.config.get("RATIO_404_MIN", 0.60) or 0.60)
-        if not self._volume_suspended():
-            for ip, count in self._volume_strikes("p404", threshold_404,
-                                                  metrics).items():
-                if count < strikes_required:
-                    continue
-                hits = metrics["hits"].get(ip, 0)
-                not_found = metrics.get("panel_404", {}).get(ip, 0)
-                if hits <= 0:
-                    continue
-                ratio = not_found / hits
-                if ratio < ratio_404_min:
-                    continue
-                profile, label = self._client_profile(ip, metrics)
-                consider(ip,
-                         f"PathBruteForce | 404: {not_found}x of {hits} "
-                         f"({ratio:.0%}), {count} intervals{label}",
-                         self._volume_tier(not_found, threshold_404, profile))
+
+        # Judged over the intent window, not per interval, and without a strike
+        # requirement — because the traffic is intent-shaped, not volume-shaped.
+        #
+        # As a volume rule this needed 30 in one interval, twice. Two of three
+        # scanners on one host escaped by finishing their sweep inside a single
+        # burst, and slow sweepers escaped from the other direction: 170 requests
+        # spread across 12 hours is about one per interval. Both failures are the
+        # same mistake the slow wp-login brute force forced us to fix in rc12,
+        # made a second time in a different rule.
+        #
+        # The ratio condition stays, and it is not optional. A site with a broken
+        # theme or a missing favicon serves 404s to real visitors, and without the
+        # ratio this rule would convict the victims of the operator's own bug. The
+        # client-evidence veto is the second half of that protection.
+        threshold_404_intent = get_int(self.config, "THRESHOLD_404_INTENT", 40)
+        for ip, not_found in metrics.get("panel_404", {}).items():
+            if not_found < threshold_404_intent:
+                continue
+            hits = metrics["hits"].get(ip, 0)
+            if hits <= 0:
+                continue
+            ratio = not_found / hits
+            if ratio < ratio_404_min:
+                continue
+            if self._looks_like_a_client(ip, metrics):
+                continue
+            consider(ip,
+                     f"PathBruteForce | 404: {not_found}x of {hits} "
+                     f"({ratio:.0%}) in {self.parser.window.intent_minutes()}m",
+                     TIER_PERMANENT)
 
         # Login attempts outside WordPress. Only POST counts — a GET of /login is
         # the form itself, and counting it would flag everyone who looked at it.
@@ -377,19 +420,83 @@ class AuditEngine:
         self.ratio_browser = float(self.config.get("ASSET_RATIO_BROWSER", 0.50) or 0.50)
         self.browser_tolerance = get_int(self.config, "BROWSER_TOLERANCE_FACTOR", 3)
 
-        total_pages = sum(metrics.get("pages", {}).values())
-        total_assets = sum(metrics.get("assets", {}).values())
+        pages = metrics.get("pages", {})
+        assets = metrics.get("assets", {})
+        total_pages = sum(pages.values())
+        total_assets = sum(assets.values())
         total = total_pages + total_assets
         site_ratio = (total_assets / total) if total else 0.0
 
+        # One pooled ratio across every vhost answers the wrong question.
+        # Measured on a host serving a court case-tracking application beside a
+        # WordPress site: the application is 80% of all traffic and genuinely
+        # asset-free, which dragged the pooled figure to 8% and switched profiling
+        # off for the WordPress vhost too — where it worked perfectly. Its real
+        # visitors were pulling 39-81% assets from the very same log the pooled
+        # figure had just declared assetless.
+        #
+        # So the question is not "what is the average" but "does anybody here
+        # behave like a browser". If several clients do, assets are being served
+        # locally and the signal is usable, whatever the mixture drags the mean to.
+        witnesses = 0
+        for ip, page_count in pages.items():
+            sample = page_count + assets.get(ip, 0)
+            if sample < self.profile_min_samples:
+                continue
+            if (assets.get(ip, 0) / sample) >= self.ratio_script:
+                witnesses += 1
+        needed = get_int(self.config, "PROFILING_MIN_WITNESSES", 3)
+
         minimum = float(self.config.get("SITE_ASSET_RATIO_MIN", 0.40) or 0.40)
-        if self.profiling and site_ratio < minimum:
+        if self.profiling and site_ratio < minimum and witnesses < needed:
             self.profiling = False
             self.flags_extra = (
                 f"[PROFILING_OFF] Site asset ratio {site_ratio:.0%} is below "
-                f"{minimum:.0%}; assets are probably served elsewhere, so "
-                f"browser-vs-script profiling is disabled for this run.")
+                f"{minimum:.0%} and only {witnesses} client(s) of "
+                f"{len(pages)} fetched assets like a browser (need {needed}); "
+                f"assets are probably served elsewhere, so browser-vs-script "
+                f"profiling is disabled for this run.")
         self.site_ratio = site_ratio
+        self.profile_witnesses = witnesses
+
+    def _looks_like_a_client(self, ip, metrics):
+        """
+        True when this address behaved like something with a browser attached.
+
+        A veto, not a modifier — the first guard in logwall based on BEHAVIOUR
+        rather than identity. Every other guard asks who an address is (whitelist,
+        the server's own address, a CDN edge, forward-confirmed DNS); this one asks
+        what it did.
+
+        Two pieces of evidence, both of which a sweeper cannot fake cheaply:
+
+          assets   it fetched stylesheets, scripts, fonts, images — the things a
+                   browser pulls on its own after receiving a page
+          success  it actually received something. A dictionary sweep collects
+                   nothing but 404s.
+
+        Measured on a WordPress host, on the addresses that requested a missing
+        plugin file. The separation was not a gradient, it was a wall:
+
+            16 sweepers      asset ratio 0.00, successes 0-1
+             5 real visitors asset ratio 0.39-0.81, successes 29-167
+
+        Known blind spot, and it matters: on a site whose assets really are on a
+        CDN, a genuine visitor also shows no assets. `ok` carries that case —
+        their HTML still returns 200 — which is why success is counted separately
+        rather than folded into the ratio.
+        """
+        successes = metrics.get("ok", {}).get(ip, 0)
+        if successes > get_int(self.config, "CLIENT_EVIDENCE_MIN_OK", 1):
+            return True
+
+        assets = metrics.get("assets", {}).get(ip, 0)
+        pages = metrics.get("pages", {}).get(ip, 0)
+        sample = assets + pages
+        if sample <= 0:
+            return False
+        minimum = float(self.config.get("CLIENT_EVIDENCE_ASSET_RATIO", 0.15) or 0.15)
+        return (assets / sample) >= minimum
 
     def _client_profile(self, ip, metrics):
         """Returns (profile, label) where label is appended to the block reason."""
