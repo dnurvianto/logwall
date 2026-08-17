@@ -2,6 +2,185 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc13 — 2026-08-17 (say what the run did; stop believing what clients claim)
+
+Twelve findings, every one of them measured on a live host rather than reasoned
+about. They fall into two groups, and the second group is the reason the first one
+had to be fixed first.
+
+### The product was telling operators things that were not true
+
+Five separate places where logwall reported something false, or withheld the one
+fact that made the line actionable.
+
+**The daily summary counted the wrong day.** Cron runs the report at 00:05, and it
+counted blacklist rows stamped with "today" — a day that was five minutes old.
+Measured: 22 blocks on one day reported as 0, and 25 blocks in the following period
+reported as 1. A second defect sat in the same line: it counted rows, so a TEMP
+block created and released between two reports left no row and was never counted
+anywhere. The one thing a daily summary exists to state was unstateable. Reports
+now summarise the day that ended and count from an append-only event record.
+
+**Status reported an empty blocklist on a host with 46 live blocks.**
+
+```
+Enforcement via : CSF coordination — blocks pushed with 'csf -d'
+Enforcement     : ON (dropping)
+LOGWALL_BL4     : 0 entries        <- csf.deny held 46
+```
+
+The set-count block was gated on whether ipset exists, not on the backend. CSF
+installs ipset itself, so logwall printed four of its own sets — which it never
+creates in that mode. CSF hosts now report what csf.deny is actually enforcing.
+
+**Guards reported a tally, not the address.** `[GUARD] WHITELIST: 1` is true and
+useless. The address→reason mapping was already in memory; only the count was
+printed. This cost real time: a prediction script bypassed the guard, reported an
+address as a pending block, and the reason it could never be blocked was sitting in
+that unprinted field.
+
+**Health flags named the whole file for one bad line.** One unresolvable request in
+537 read as "this log is unusable". Both flags now carry the affected share, and a
+log that lost nothing raises no flag.
+
+**And the cron line logwall installs discarded every diagnostic it emits.** It
+ended in `>/dev/null 2>&1`, and PROFILING_OFF, GUARD refusals, CSF_RESYNC,
+SETTING_RENAMED and CDN_NO_REALIP all go to stderr. On one host PROFILING_OFF fired
+on every run for a day while the daily report said `[FLAG] none`. Output now goes
+to a run log which logwall trims itself, and the last run's flags are persisted so
+the report can state them hours later.
+
+### A client could choose which address logwall blocked
+
+`_recover_real_ip()` scanned the whole log line for anything shaped like an address
+and used the first one that was not the peer, whenever the peer sat in a CDN range.
+The URI, the referer and the user-agent are all in that line and all under the
+client's control — and `reversed()` preferred exactly those, because they come last.
+
+```
+GET / HTTP/1.1" 200 512 "-" "Mozilla/5.0 (8.8.8.8)"
+                                          ^ became "the real client"
+```
+
+The useful direction for an attacker is the other one: forward the operator's own
+whitelisted address and every guard refuses to block you, on every cycle, forever,
+while the run log says only `[GUARD] WHITELIST: 1`.
+
+Proven on a live host with no CDN involved at all — a request sent from the admin's
+own address carrying `X-Forwarded-For: 192.0.2.77` was logged as 192.0.2.77,
+because the web server trusted forwarding headers from anyone.
+
+A forwarding header is now read only when the peer is a CDN edge already trusted,
+which is the same rule nginx enforces with `set_real_ip_from`. Two things turned up
+while implementing it: the trailing XFF field was never captured by the log regex
+at all, so the "recover real IP from XFF" behaviour tested since 1.0 was
+implemented *entirely* by the unsafe line scan; and Python's `is_private` covers
+the documentation ranges every test and tutorial uses.
+
+**And when the client field itself cannot be believed, logwall stops punishing.** A
+public server cannot be reached from 10.0.0.5. One of those in the client field
+proves something upstream is rewriting it from a client-supplied header, so
+blocking is suspended, the addresses that prove it are named, and the fix is
+printed for nginx, Apache and LiteSpeed. Measured rather than parsed from config,
+because that misconfiguration wears a different directive name in every web server.
+
+Preflight warns rather than refusing to install: a product that will not start
+reads as broken rather than careful.
+
+### Webshell hunters walked free for a day
+
+Four addresses, 170/117/50/47 requests each, every one a 404, hunting for shells
+somebody else had already planted. They slipped between four rules at once — no
+scanner UA, random .php names absent from the sensitive-file list, xmlrpc touched
+once, and 404 counted as volume at 30 per interval while 170 requests over twelve
+hours is about one per interval.
+
+That last one is rc12's lesson repeated in a different rule, and it failed in both
+directions: one scanner escaped by finishing inside a single burst, the others by
+going slow.
+
+A 404 on a page is ordinary. A 404 on a **source file** is not, because visitors
+and crawlers follow links and nothing links to `/dvoqqmkm.php`. Measured on 636,000
+requests: 73 source-file 404s against 1,345 page 404s, and all 19 addresses
+responsible were hostile — including two wearing legitimate crawler names.
+
+**The count cannot carry the rule, and that is the part worth keeping.** On a
+WordPress host that had removed an accessibility plugin, five real visitors on
+phones kept asking for a file that no longer existed. One of them 14 times — more
+than nine of the sixteen genuine sweepers on that host. Any threshold on the number
+is either blind or cruel, and the number that looked safe on the busiest host would
+have blocked real people reaching a court's website through its screen reader.
+
+What separates them is whether the address behaved like a client at all:
+
+```
+16 sweepers        asset ratio 0.00, successes 0-1
+ 5 real visitors   asset ratio 0.39-0.81, successes 29-167
+```
+
+Not a gradient — a wall. Both 404 rules now consult a behavioural veto, the first
+guard in logwall based on what an address did rather than who it is. Success is
+counted separately from the asset ratio, because on a genuinely CDN-fronted site a
+real visitor shows no asset requests either while their HTML still returns 200.
+
+`PathBruteForce` moves to the intent window for the same reason.
+
+### The profiling gate was asking the wrong question
+
+```
+Site asset ratio 8% is below 40%; assets are probably served elsewhere
+```
+
+False on the host that said it. Its real visitors were pulling 39-81% assets from
+that very log. What dragged the pooled figure down was a court case-tracking
+application sharing the host — 80% of traffic, genuinely asset-free — which
+disabled profiling for the WordPress vhost too. "What is the average" is not "does
+anybody here behave like a browser".
+
+### Housekeeping with teeth
+
+**Members covered by an accepted range are now removed.** 70 individual /64 entries
+sat under one accepted /56 on a production host: 69% of that blacklist was
+redundant. Removals are announced individually and name the entry that covers them.
+
+**And CSF hosts can finally step off the escalation ladder.** `csf -d` was a
+one-way door — logwall dropped an expired TEMP entry and csf.deny kept it forever,
+so every temporary block on a CSF host was silently permanent.
+
+**Sixteen dead settings removed**, and the suite now asserts that every shipped
+setting is read by some code path. Two of them were worse than untidy:
+`REAL_IP_FIELD` and `TRUSTED_PROXIES` promised that forwarded identities were being
+verified while nothing verified anything.
+
+### One structural change, no behaviour change
+
+The parser's bare ten-tuple becomes named containers with the trust status of every
+field written beside it. That anonymity was not incidental to the bug above: a
+helper called `_recover_real_ip(peer_ip, line)` looked reasonable next to nine other
+unnamed positional fields, and treated the user-agent as an identity source for
+three releases.
+
+### Deliberately NOT in this release
+
+Threshold recalibration. Field data says the current numbers are wrong for quiet
+hosts — one has a p99 peak-per-interval of 4 against a threshold of 60 — but the
+rules that decide what gets blocked changed in this release, so calibrating against
+pre-rc13 measurements would be work thrown away. It needs several days of rc13 data
+from hosts with different traffic shapes.
+
+The direction of the current error is the safe one: too loose means the volume class
+stays quiet, and on those hosts the intent class already carries everything — 23 of
+23 blocks on the quietest host came from intent rules.
+
+### Tests
+
+205 → 280 offline checks. Gate unchanged at 72.
+
+The false-positive case is a fixture, and it is verified to fail for the right
+reason: the signal fires (14 source-file 404s against a threshold of 2) and the veto
+is what spares the visitor. A test that passed because the rule never looked would
+have been worse than no test at all.
+
 ## 1.0.0-rc12 — 2026-08-16 (counters decay; two classes of signal, two windows)
 
 The counter never went down. `prune()` dropped an address whole once it had been
