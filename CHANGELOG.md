@@ -294,6 +294,21 @@ ranges is not. The domain list says who would be believed; the forward lookup is
 what proves it. Suffixes match on a dot boundary, so `evil-googlebot.com` does not
 pass as `googlebot.com`.
 
+Which crawlers are spared is a policy question, and the test is narrow: would
+blocking it cost the SITE OWNER something. A search engine that sends visitors is
+worth sparing even when it is expensive. An SEO tool, a social-media preview fetcher
+or an archive sends no visitors and costs bandwidth, so sparing it would be a
+decision made on the operator's behalf about their own bill. Those are recognised and
+named in the verdict — "blocked SemrushBot" and "blocked 185.191.171.10" are the same
+fact and not the same information — and they stay blockable.
+
+The first version of that list got it wrong twice, and one was a hole rather than a
+preference: `googleusercontent.com` is the reverse-DNS suffix of Google Cloud
+CUSTOMER VMs, not of Googlebot. Protecting it would have handed permanent immunity to
+anyone willing to rent an instance — the exact population this product exists to
+block. It was caught by releasing four SemrushBot addresses on a host whose owner had
+just paid for extra bandwidth, which made the whole list worth re-reading.
+
 It is asked last, of a candidate that has already survived every cheaper guard, so
 lookups are spent on decisions rather than on requests. Results cache for thirty
 days. A DNS failure is deliberately NOT cached — a transient outage must not pin a

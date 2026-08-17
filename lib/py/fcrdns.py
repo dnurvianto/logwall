@@ -35,34 +35,74 @@ import os
 import socket
 import time
 
-# Domains whose forward-confirmed names identify a crawler worth sparing.
+# Crawlers whose blocking would cost the SITE OWNER something.
+#
+# That is the whole test for membership here, and it is narrower than "well-known
+# bot". A search engine that sends visitors is worth sparing even when it is
+# expensive; a third-party scraper that consumes bandwidth and returns nothing is
+# not, and the operator who paid for that bandwidth is entitled to block it.
 #
 # Matched as a suffix on a dot boundary, so `evil-msn.com` cannot pass as
 # `search.msn.com` and `notgoogle.com` cannot pass as `google.com`.
+#
+# `googleusercontent.com` is deliberately ABSENT. It is the reverse-DNS suffix of
+# Google Cloud customer VMs, not of Googlebot — protecting it would have handed
+# permanent immunity to anyone willing to rent an instance, which is precisely the
+# population this product exists to block.
 CRAWLER_DOMAINS = (
-    "googlebot.com", "google.com", "googleusercontent.com",
+    "googlebot.com", "google.com",
     "search.msn.com", "msn.com", "bing.com",
     "duckduckgo.com",
     "yandex.com", "yandex.ru", "yandex.net",
     "baidu.com", "baidu.jp",
-    "applebot.apple.com", "apple.com",
-    "facebook.com", "fbsv.net",
-    "ahrefs.com", "semrush.com",
-    "archive.org",
-    "linkedin.com",
+    "applebot.apple.com",
     "petalsearch.com", "aspiegel.com",
 )
 
+# Recognised, named in the report — and still blockable.
+#
+# These identify themselves honestly and verify correctly, but they are SEO tools,
+# social-media preview fetchers and archives. None of them sends the site any
+# visitors, and all of them cost bandwidth. Sparing them would be a policy choice
+# made on the operator's behalf about their own bill, which is not logwall's to make:
+# the operator who is paying for the traffic decides.
+#
+# Kept as a list rather than dropped, so a verdict can say WHO it blocked. "Blocked
+# 185.191.171.10" and "blocked SemrushBot" are the same fact and not the same
+# information.
+KNOWN_CRAWLER_DOMAINS = (
+    "ahrefs.com", "semrush.com",
+    "facebook.com", "fbsv.net",
+    "linkedin.com",
+    "archive.org",
+    "bytedance.com", "bytespider.com",
+    "openai.com", "anthropic.com",
+)
 
-def _matches_crawler_domain(hostname):
+
+def _suffix_match(hostname, domains):
     """Suffix match on a dot boundary. `evil-google.com` must not pass."""
     name = (hostname or "").strip().rstrip(".").lower()
     if not name:
         return None
-    for domain in CRAWLER_DOMAINS:
+    for domain in domains:
         if name == domain or name.endswith("." + domain):
             return domain
     return None
+
+
+def _matches_crawler_domain(hostname):
+    """The domain whose blocking would cost the site owner, or None."""
+    return _suffix_match(hostname, CRAWLER_DOMAINS)
+
+
+def identify_crawler(hostname):
+    """
+    A name for a crawler that is recognised but NOT spared, or None.
+
+    Used only to make a verdict legible. It never changes a decision.
+    """
+    return _suffix_match(hostname, KNOWN_CRAWLER_DOMAINS)
 
 
 class FCrDNS:

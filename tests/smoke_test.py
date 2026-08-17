@@ -2339,6 +2339,30 @@ check("fcrdns: a trailing dot is tolerated",
       fcrdns._matches_crawler_domain("crawl.googlebot.com."))
 check("fcrdns: empty is not a match", fcrdns._matches_crawler_domain("") is None)
 
+# --- who is spared is a POLICY question, and it is narrow --------------------
+#
+# The test for membership is whether blocking would cost the SITE OWNER something.
+# A search engine that sends visitors is worth sparing even when it is expensive; a
+# scraper that consumes bandwidth and returns nothing is not, and the operator who
+# paid that bill is entitled to block it.
+for host in ("crawl-66-249-66-1.googlebot.com",
+             "msnbot-40-77-167-1.search.msn.com",
+             "crawl-1.duckduckgo.com",
+             "spider-5-45-207-1.yandex.com",
+             "baiduspider-1.crawl.baidu.com"):
+    check("policy: %s is spared" % host.split(".", 1)[1],
+          fcrdns._matches_crawler_domain(host) is not None, host)
+
+for host in ("bot-185-191-171-1.semrush.com", "crawl-1.ahrefs.com",
+             "fetcher.facebook.com", "ia-archiver.archive.org"):
+    check("policy: %s is recognised but still blockable" % host.split(".", 1)[1],
+          fcrdns._matches_crawler_domain(host) is None
+          and fcrdns.identify_crawler(host) is not None, host)
+
+# the hole that mattered most: Google Cloud customer VMs are NOT Googlebot
+check("policy: googleusercontent.com is NOT spared — those are rented VMs",
+      fcrdns._matches_crawler_domain("1-2-3-4.bc.googleusercontent.com") is None)
+
 # --- the guard refuses a verified crawler, and says why ----------------------
 gcfg = dict(cfg)
 gcfg["STATE_DIR"] = steady(os.path.join(work, "state_fcguard"))
