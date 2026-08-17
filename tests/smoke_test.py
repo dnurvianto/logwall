@@ -1966,6 +1966,24 @@ _, ent_legacy = eng_legacy.execute(dry_run=False)
 check("rotation: pre-rc13 history has no signal class, so it cannot qualify a range",
       "216.73.217.0/24" not in ent_legacy, sorted(ent_legacy))
 
+# ...unless the blacklist still holds the reason, which is checkable evidence
+bf_state = steady(os.path.join(work, "state_rot_backfill"))
+bf_cfg = dict(cfg)
+bf_cfg["STATE_DIR"] = bf_state
+bf_cfg["BLACKLIST"] = os.path.join(work, "blacklist_rot_backfill.txt")
+with open(bf_cfg["BLACKLIST"], "w", encoding="utf-8") as fh:
+    for n in (7, 44, 74, 111):
+        fh.write("216.73.218.%d    # 2026-08-17 10:00 | CloudScraper | PERMANENT | "
+                 "strike=1 | expires=-\n" % n)
+with open(os.path.join(bf_state, "offender_history.json"), "w", encoding="utf-8") as fh:
+    json.dump(dict(("216.73.218.%d" % n, {"strike": 1, "last": int(time.time())})
+                   for n in (7, 44, 74, 111)), fh)
+eng_bf = apply_engine.ApplyEngine(bf_cfg)
+eng_bf.audit.evaluate_candidates = lambda panel=None: {}
+_, ent_bf = eng_bf.execute(dry_run=False)
+check("rotation: the class is recovered from the blacklist, so the rule works at once",
+      "216.73.218.0/24" in ent_bf, sorted(t for t in ent_bf if "/" in t))
+
 # and the whitelist still wins
 wl = dict(("203.0.113.%d" % n, {"strike": 1, "last": int(time.time()),
                                 "class": "CloudScraper"})

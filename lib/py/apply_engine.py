@@ -245,6 +245,17 @@ class ApplyEngine:
             history[entry.target]["class"] = entry.reason.split("|", 1)[0].strip()
             self.added.append(entry)
 
+        # 3a. Recover the signal class for records written before it was stored.
+        #
+        # Requiring a class was right — a range must not qualify on evidence that
+        # cannot be checked — but on first deployment it made the rule inert for
+        # days while the history refilled, and the evidence was sitting in the
+        # blacklist all along: every entry carries the reason that put it there.
+        for target, entry in entries.items():
+            record = history.get(target)
+            if isinstance(record, dict) and not record.get("class"):
+                record["class"] = entry.reason.split("|", 1)[0].strip()
+
         # 3b. Ranges whose offenders keep arriving from fresh addresses.
         for target, meta in self._rotating_ranges(history, entries).items():
             entry = BlacklistEntry(target, date_str, meta["reason"], meta["tier"],

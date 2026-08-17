@@ -195,9 +195,10 @@ them. Blocking the first is the only thing that stops the rotation.
 
 Tier follows the existing philosophy rather than inventing one: a range whose
 offenders were volume-class gets TEMP and can age out; one whose offenders showed
-intent gets PERMANENT. History written before rc13 carries no signal class, and is
-therefore never counted — a range must not qualify on evidence that cannot be
-checked.
+intent gets PERMANENT. History written before rc13 carries no signal class. Where the entry is still in
+the blacklist the class is recovered from it, because that evidence is checkable;
+where the entry has already expired the record stays unclassified and is never
+counted, because that evidence really is gone.
 
 ### Deliberately NOT in this release
 
@@ -213,7 +214,7 @@ stays quiet, and on those hosts the intent class already carries everything — 
 
 ### Tests
 
-205 → 292 offline checks. Gate unchanged at 72.
+205 → 293 offline checks. Gate unchanged at 72.
 
 The false-positive case is a fixture, and it is verified to fail for the right
 reason: the signal fires (14 source-file 404s against a threshold of 2) and the veto
