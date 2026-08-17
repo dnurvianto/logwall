@@ -1893,6 +1893,96 @@ check("factclaim: parsing yields named requests, not anonymous tuples",
       ).__name__ == "RawRequest")
 
 
+# ====================================== rc13: rotation defeats per-address strikes
+#
+# Measured on a production host: one crawler held eight addresses in the offender
+# history, seven TEMP and expiring, two more already active and unblocked. Every
+# block was correct and nothing was ever learned. The /24 averaged 94 hits per
+# interval against a subnet threshold of 300, so no existing rule could reach it.
+
+def rotation_engine(name, history, extra=None):
+    st = steady(os.path.join(work, "state_" + name))
+    local = dict(cfg)
+    local["STATE_DIR"] = st
+    local["BLACKLIST"] = os.path.join(work, "blacklist_" + name + ".txt")
+    if extra:
+        local.update(extra)
+    with open(os.path.join(st, "offender_history.json"), "w", encoding="utf-8") as fh:
+        json.dump(history, fh)
+    eng = apply_engine.ApplyEngine(local)
+    eng.audit.evaluate_candidates = lambda panel=None: {}
+    return eng
+
+# one actor rotating addresses: same signal every time
+same = dict(("216.73.216.%d" % n, {"strike": 1, "last": int(time.time()),
+                                   "class": "CloudScraper"})
+            for n in (7, 44, 74, 111, 138, 163, 188, 248))
+eng = rotation_engine("rot_same", same)
+_, ent = eng.execute(dry_run=False)
+check("rotation: a range that keeps producing fresh offenders is blocked",
+      "216.73.216.0/24" in ent, sorted(t for t in ent if "/" in t))
+check("rotation: the reason states how many addresses and which signal",
+      "8 addresses, all CloudScraper" in ent["216.73.216.0/24"].reason,
+      ent.get("216.73.216.0/24").reason if "216.73.216.0/24" in ent else None)
+check("rotation: a volume-class actor gets TEMP, keeping the ladder intact",
+      ent["216.73.216.0/24"].tier == "TEMP", ent["216.73.216.0/24"].tier)
+
+# a hosting provider whose tenants are independently compromised: mixed signals
+mixed = {
+    "103.253.27.103": {"strike": 1, "last": int(time.time()), "class": "XmlRpcExploit"},
+    "103.253.27.105": {"strike": 1, "last": int(time.time()), "class": "XmlRpcExploit"},
+    "103.253.27.59":  {"strike": 1, "last": int(time.time()), "class": "XmlRpcExploit"},
+    "103.253.27.51":  {"strike": 1, "last": int(time.time()), "class": "BruteForce"},
+}
+eng_mixed = rotation_engine("rot_mixed", mixed)
+_, ent_mixed = eng_mixed.execute(dry_run=False)
+check("rotation: mixed signals in one range are NOT one actor, so no range block",
+      "103.253.27.0/24" not in ent_mixed, sorted(ent_mixed))
+
+# intent-class rotation goes straight to PERMANENT, as intent always has
+intent = dict(("45.148.10.%d" % n, {"strike": 1, "last": int(time.time()),
+                                    "class": "ReconScanner"})
+              for n in (10, 11, 12, 13))
+eng_intent = rotation_engine("rot_intent", intent)
+_, ent_intent = eng_intent.execute(dry_run=False)
+check("rotation: an intent-class actor is permanent, like every intent verdict",
+      ent_intent.get("45.148.10.0/24") is not None
+      and ent_intent["45.148.10.0/24"].tier == "PERMANENT",
+      ent_intent.get("45.148.10.0/24"))
+
+# below the threshold, nothing happens
+few = dict(("93.123.109.%d" % n, {"strike": 1, "last": int(time.time()),
+                                  "class": "ReconScanner"}) for n in (228, 234))
+eng_few = rotation_engine("rot_few", few)
+_, ent_few = eng_few.execute(dry_run=False)
+check("rotation: two addresses is a coincidence, not a pattern",
+      "93.123.109.0/24" not in ent_few, sorted(ent_few))
+
+# history written before the class was recorded must not qualify a range
+legacy = dict(("216.73.217.%d" % n, {"strike": 1, "last": int(time.time())})
+              for n in (7, 44, 74, 111, 138))
+eng_legacy = rotation_engine("rot_legacy", legacy)
+_, ent_legacy = eng_legacy.execute(dry_run=False)
+check("rotation: pre-rc13 history has no signal class, so it cannot qualify a range",
+      "216.73.217.0/24" not in ent_legacy, sorted(ent_legacy))
+
+# and the whitelist still wins
+wl = dict(("203.0.113.%d" % n, {"strike": 1, "last": int(time.time()),
+                                "class": "CloudScraper"})
+          for n in (10, 11, 12, 13))
+eng_wl = rotation_engine("rot_wl", wl)
+_, ent_wl = eng_wl.execute(dry_run=False)
+check("rotation: a range overlapping the whitelist is refused, not blocked",
+      "203.0.113.0/24" not in ent_wl, sorted(ent_wl))
+check("rotation: and the refusal is recorded with a reason",
+      any("203.0.113" in str(k) for k in eng_wl.audit.refused),
+      eng_wl.audit.refused)
+
+check("rotation: the guard can be switched off",
+      "216.73.216.0/24" not in rotation_engine(
+          "rot_off", same, {"ROTATION_GUARD": "0"}).execute(dry_run=False)[1])
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

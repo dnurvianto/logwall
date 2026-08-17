@@ -239,7 +239,22 @@ class ApplyEngine:
             entries[entry.target] = entry
             history.setdefault(entry.target, {})["strike"] = entry.strike
             history[entry.target]["last"] = now
+            # The signal class, kept so a range can later be judged on whether its
+            # offenders were one actor or many unrelated tenants. See
+            # _rotating_ranges().
+            history[entry.target]["class"] = entry.reason.split("|", 1)[0].strip()
             self.added.append(entry)
+
+        # 3b. Ranges whose offenders keep arriving from fresh addresses.
+        for target, meta in self._rotating_ranges(history, entries).items():
+            entry = BlacklistEntry(target, date_str, meta["reason"], meta["tier"],
+                                   1, now + self.temp_hours * 3600
+                                   if meta["tier"] == TIER_TEMP else None)
+            entries[target] = entry
+            self.added.append(entry)
+            history.setdefault(target, {})["strike"] = 1
+            history[target]["last"] = now
+            history[target]["class"] = meta["class"]
 
         # 4. Drop entries a wider accepted range already covers.
         #
@@ -296,6 +311,99 @@ class ApplyEngine:
                           json.dumps({"ts": now, "flags": notable}, indent=2) + "\n")
         except OSError:
             pass
+
+    def _rotating_ranges(self, history, entries):
+        """
+        Ranges that keep producing new offenders from fresh addresses.
+
+        The escalation ladder counts strikes per ADDRESS, so an actor who simply
+        uses a different address each time never reaches strike 2 and is met with a
+        fresh TEMP block forever. Measured on a production host: one crawler had
+        eight addresses in the offender history, seven of them TEMP and expiring,
+        while two more addresses had already appeared in the log unblocked. logwall
+        punished correctly every single time and learned nothing.
+
+        The existing subnet rules cannot reach this. `SubnetCoordinatedAttack` wants
+        simultaneous activity, and the per-interval rollup wants volume: that /24
+        averaged 94 hits per interval against a threshold of 300, because the actor
+        spread 68,000 requests across a day and eight addresses.
+
+        Two conditions, and the second is what makes a range block safe:
+
+          count  at least ROTATION_MIN_OFFENDERS distinct addresses in the range
+                 have each independently tripped a signal, at any time
+          class  all of them tripped the SAME signal
+
+        The class condition separates one actor from one bad neighbourhood, and the
+        distinction is not theoretical. On the same host:
+
+            216.73.216.0/24   8 addresses, 8x CloudScraper       -> one actor
+            103.253.27.0/24   4 addresses, XmlRpc x3 + BruteForce -> a hosting
+                                                                   provider whose
+                                                                   tenants are
+                                                                   independently
+                                                                   compromised
+
+        Blocking the second range would punish every other customer of that host for
+        four of them. Blocking the first is the only thing that stops the rotation.
+
+        Tier follows the existing philosophy rather than inventing a new one: a range
+        whose offenders were volume-class gets TEMP and can age out, one whose
+        offenders showed intent gets PERMANENT.
+        """
+        if not get_bool(self.config, "ROTATION_GUARD", True):
+            return {}
+
+        minimum = get_int(self.config, "ROTATION_MIN_OFFENDERS", 4)
+        v4_prefix = get_int(self.config, "ROTATION_PREFIX_V4", 24)
+        v6_prefix = get_int(self.config, "ROTATION_PREFIX_V6", 64)
+
+        groups = {}
+        for target, record in history.items():
+            if not isinstance(record, dict):
+                continue
+            signal = record.get("class")
+            if not signal:
+                # Written by a version that did not record the class. Counting it
+                # would let a range qualify on evidence we cannot check.
+                continue
+            try:
+                net = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                continue
+            if net.num_addresses > 1:
+                continue
+            prefix = v4_prefix if net.version == 4 else v6_prefix
+            try:
+                key = str(ipaddress.ip_network(
+                    "%s/%d" % (net.network_address, prefix), strict=False))
+            except ValueError:
+                continue
+            groups.setdefault(key, {"members": set(), "classes": set()})
+            groups[key]["members"].add(target)
+            groups[key]["classes"].add(signal)
+
+        volume_classes = {"CloudScraper", "HighBandwidth", "Subnet6Flood",
+                          "SubnetFlood", "PathBruteForce"}
+        proposed = {}
+        for key, group in groups.items():
+            if len(group["members"]) < minimum or len(group["classes"]) != 1:
+                continue
+            if key in entries:
+                continue
+            signal = next(iter(group["classes"]))
+            refusal = self.guard.refusal_reason_network(
+                key, v4_prefix, get_int(self.config, "MAX_BLOCK_PREFIX_V6", 56))
+            if refusal:
+                self.audit.refused[key] = refusal
+                continue
+            proposed[key] = {
+                "reason": "RotatingOffender | %d addresses, all %s"
+                          % (len(group["members"]), signal),
+                "tier": TIER_TEMP if signal in volume_classes else TIER_PERMANENT,
+                "class": signal,
+            }
+        return proposed
 
     def _prune_superseded(self, entries):
         """

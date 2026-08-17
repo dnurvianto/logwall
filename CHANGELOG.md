@@ -160,6 +160,45 @@ helper called `_recover_real_ip(peer_ip, line)` looked reasonable next to nine o
 unnamed positional fields, and treated the user-agent as an identity source for
 three releases.
 
+### Rotation defeated the escalation ladder, and nothing noticed
+
+Strikes are counted per address. An actor who uses a different address each time
+never reaches strike 2, so it is met with a fresh TEMP block forever.
+
+Measured on a production host: one crawler held eight addresses in the offender
+history, seven of them TEMP and expiring, while two more were already active in the
+log unblocked. Every block was correct. Nothing was ever learned.
+
+No existing rule could reach it. `SubnetCoordinatedAttack` wants simultaneous
+activity, and the per-interval rollup wants volume — that /24 averaged 94 hits per
+interval against a threshold of 300, because 68,000 requests were spread across a
+day and eight addresses. It was also, by bytes, the single largest bandwidth
+consumer on the host: 290 MB.
+
+A range is now blocked when enough distinct addresses inside it have each
+independently tripped a signal — cumulative over the offender history, not within a
+window. Two conditions, and the second is what makes a range block safe:
+
+    count  ROTATION_MIN_OFFENDERS distinct addresses, at any time
+    class  all of them tripped the SAME signal
+
+The class condition separates one actor from one bad neighbourhood, and the
+distinction is not theoretical. On the same host:
+
+    216.73.216.0/24   8 addresses, 8x CloudScraper        -> one actor
+    103.253.27.0/24   4 addresses, XmlRpc x3 + BruteForce -> a hosting provider whose
+                                                            tenants are independently
+                                                            compromised
+
+Blocking the second would punish every other customer of that provider for four of
+them. Blocking the first is the only thing that stops the rotation.
+
+Tier follows the existing philosophy rather than inventing one: a range whose
+offenders were volume-class gets TEMP and can age out; one whose offenders showed
+intent gets PERMANENT. History written before rc13 carries no signal class, and is
+therefore never counted — a range must not qualify on evidence that cannot be
+checked.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet
@@ -174,7 +213,7 @@ stays quiet, and on those hosts the intent class already carries everything — 
 
 ### Tests
 
-205 → 280 offline checks. Gate unchanged at 72.
+205 → 292 offline checks. Gate unchanged at 72.
 
 The false-positive case is a fixture, and it is verified to fail for the right
 reason: the signal fires (14 source-file 404s against a threshold of 2) and the veto
