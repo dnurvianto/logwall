@@ -200,6 +200,46 @@ the blacklist the class is recovered from it, because that evidence is checkable
 where the entry has already expired the record stays unclassified and is never
 counted, because that evidence really is gone.
 
+### Three bugs this release introduced, found by deploying it
+
+None was caught by the suite. Each was found because a real host disagreed with it,
+which is the only reason to record them here rather than quietly fixing them.
+
+**A missed CSF release vanished instead of retrying.** The release list was built
+from one run's deltas, so a pruning that happened while ENFORCE=0 never reached
+`csf -dr`, and the next run overwrote the list. Three entries stayed in another
+agent's config with nothing tracking them. Releases are now derived by diffing a
+durable record, and the record seeds itself from csf.deny — matching only entries
+whose comment carries one of logwall's own verdict names, which is recognising our
+own output rather than guessing at ownership. lfd's comments carry a distinct prefix
+and the two cannot be confused. Without that seeding, orphans that predate the record
+could never be recovered.
+
+The release step also no longer sits behind ENFORCE. It removes blocks rather than
+adding them, so there was nothing there for the safety switch to protect.
+
+**The rotation guard was inert on arrival.** It refused history records with no
+recorded signal class, which is right in principle — a range must not qualify on
+evidence that cannot be checked — but on first deployment that meant days of doing
+nothing while the history refilled, on a host whose largest bandwidth consumer was
+exactly the case it exists for. The class is now recovered from the blacklist, where
+every entry carries the reason that put it there.
+
+**The profiling witness count could not see half its witnesses.** It iterated page
+requests, so a client that fetched only assets — the shape a browser has when its
+HTML came from cache — was never counted at all. And its sample floor was
+ASSET_MIN_SAMPLES=30, which against an intent-window sum means "30 requests in half
+an hour": a bar most individual visitors never clear. The measured result was 1
+witness of 316 clients on one host and 0 of 404 on another, so the mechanism this
+release added never fired in production. Counting now covers assets and pages, with
+its own floor.
+
+**And one that is still open.** `--no-confirm` skipped arming the deadman on a
+standalone host in complete silence — the only branch that explained itself was the
+CSF one. Correct for cron, which cannot answer a prompt, but a human who types it was
+told nothing. It now says so, and says that an existing SSH session proves nothing
+because it predates the rules.
+
 ### Deliberately NOT in this release
 
 Threshold recalibration. Field data says the current numbers are wrong for quiet
@@ -214,7 +254,7 @@ stays quiet, and on those hosts the intent class already carries everything — 
 
 ### Tests
 
-205 → 293 offline checks. Gate unchanged at 72.
+205 → 301 offline checks. Gate unchanged at 72.
 
 The false-positive case is a fixture, and it is verified to fail for the right
 reason: the signal fires (14 source-file 404s against a threshold of 2) and the veto

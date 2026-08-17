@@ -328,6 +328,15 @@ cmd_apply() {
     elif [ "$csf_mode" -eq 1 ]; then
         say "[INFO] No deadman armed: in CSF mode logwall changes no rules, so there is"
         say "[INFO] nothing to roll back. Releases happen with 'csf -dr <ip>'."
+    else
+        # --no-confirm on a standalone host. Correct for cron, which cannot answer a
+        # prompt — and `say` keeps it out of the run log because cron also passes
+        # --quiet. But a human who types it deserves to know the net is off: this
+        # branch used to be silent, so the run looked identical either way.
+        say "[INFO] No deadman armed: --no-confirm was given. Rules are in place with"
+        say "[INFO] no automatic rollback. Verify a NEW connection now — an existing"
+        say "[INFO] session proves nothing, it was established before these rules."
+        say "[INFO] To roll back: logwall firewall rollback ${snapshot_id}"
     fi
 
     say "[DONE] Apply completed (snapshot ${snapshot_id})."

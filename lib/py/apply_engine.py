@@ -42,6 +42,18 @@ RESERVED_FOREIGN_SETS = {
 
 COMMENT_SAFE_RE = re.compile(r'[^\w\s.:/|=+-]')
 
+# Every verdict name logwall can write into a csf.deny comment. Used to recognise
+# our own entries there — never to guess at ownership. lfd's comments begin with a
+# distinct `lfd:` prefix, so the two cannot be confused.
+LOGWALL_VERDICTS = frozenset((
+    "AuthBruteForce", "BruteForce", "CloudScraper", "GenericLoginBrute",
+    "HighBandwidth", "IntentComposite", "PanelBruteForce", "PathBruteForce",
+    "ReconScanner", "RotatingOffender", "Subnet6AuthBruteForce",
+    "Subnet6CoordinatedAttack", "Subnet6Flood", "Subnet6HighBandwidth",
+    "SubnetAuthBruteForce", "SubnetCoordinatedAttack", "SubnetFlood",
+    "SubnetHighBandwidth", "ToolSignature", "WebshellHunter", "XmlRpcExploit",
+))
+
 
 def sanitize_comment(text):
     """ipset comments are quoted strings; keep them boring and short."""
@@ -617,7 +629,21 @@ class ApplyEngine:
         return os.path.join(self.state_dir, "csf_pushed.json")
 
     def load_pushed_record(self):
-        """Addresses logwall pushed to CSF, so it knows which are its to release."""
+        """
+        Addresses logwall pushed to CSF, so it knows which are its to release.
+
+        On the first run the file does not exist, and a record seeded as empty can
+        never recover entries that were already pushed — three of them sat orphaned
+        in csf.deny on the host this was verified against. So the record is seeded
+        from csf.deny itself, matching only entries whose comment carries one of
+        logwall's own verdict names.
+
+        That is recognising our own output, not guessing at ownership. lfd writes a
+        distinct prefix and the two are never confusable:
+
+            78.153.140.39 # ReconScanner - Sat Aug 15 22:58:23 2026        <- ours
+            185.x.x.x # lfd: (PERMBLOCK) ... has had more than ...         <- not
+        """
         try:
             with open(self._pushed_record_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -625,7 +651,27 @@ class ApplyEngine:
                 return set(str(item) for item in data)
         except (OSError, ValueError):
             pass
-        return set()
+        return self._seed_pushed_from_csf()
+
+    def _seed_pushed_from_csf(self):
+        """Entries in csf.deny that carry a logwall verdict name in their comment."""
+        path = get_path(self.config, "CSF_DENY", "/etc/csf/csf.deny")
+        found = set()
+        if not os.path.isfile(path):
+            return found
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    body, _, comment = line.partition("#")
+                    target = body.strip()
+                    if not target or "|" in target:
+                        continue
+                    label = comment.strip().split("|", 1)[0].split("-", 1)[0].strip()
+                    if label in LOGWALL_VERDICTS:
+                        found.add(target.split()[0])
+        except OSError:
+            pass
+        return found
 
     def emit_csf_release(self, path, entries=None):
         """

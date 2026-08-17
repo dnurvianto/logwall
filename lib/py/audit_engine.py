@@ -438,12 +438,25 @@ class AuditEngine:
         # So the question is not "what is the average" but "does anybody here
         # behave like a browser". If several clients do, assets are being served
         # locally and the signal is usable, whatever the mixture drags the mean to.
+        # Counted over pages AND assets, because a client can be all assets and no
+        # pages — the first version iterated `pages` alone and never saw those at
+        # all, which is exactly the shape a browser has when its HTML came from
+        # cache. Measured on one host: a visitor with 52 asset requests and zero
+        # page requests was invisible to the witness count.
+        #
+        # The sample floor is its own setting rather than ASSET_MIN_SAMPLES, which
+        # is 30. These metrics are intent-window sums, so 30 means "30 requests
+        # inside INTENT_WINDOW_MIN" — a bar most individual visitors never clear in
+        # half an hour, which made the witness mechanism almost never fire: 1 client
+        # of 316 on one host, 0 of 404 on another.
+        floor = get_int(self.config, "PROFILING_WITNESS_MIN_SAMPLES", 8)
         witnesses = 0
-        for ip, page_count in pages.items():
-            sample = page_count + assets.get(ip, 0)
-            if sample < self.profile_min_samples:
+        for ip in set(pages) | set(assets):
+            asset_count = assets.get(ip, 0)
+            sample = pages.get(ip, 0) + asset_count
+            if sample < floor:
                 continue
-            if (assets.get(ip, 0) / sample) >= self.ratio_script:
+            if (asset_count / sample) >= self.ratio_script:
                 witnesses += 1
         needed = get_int(self.config, "PROFILING_MIN_WITNESSES", 3)
 

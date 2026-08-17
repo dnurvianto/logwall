@@ -2001,6 +2001,65 @@ check("rotation: the guard can be switched off",
           "rot_off", same, {"ROTATION_GUARD": "0"}).execute(dry_run=False)[1])
 
 
+# ============================== rc13 follow-up: three bugs found by deploying
+#
+# All three were in code written earlier the same day, and none was caught by this
+# suite until after a real host disagreed with it.
+
+# --- the profiling witness count missed asset-only clients -------------------
+only_assets = {"pages": {}, "assets": {"203.0.113.%d" % n: 12 for n in range(5)}}
+wa = audit_engine.AuditEngine(dict(cfg))
+wa._calibrate_client_profiling(only_assets)
+check("witness: a client with assets and no pages is still a witness",
+      wa.profile_witnesses == 5, wa.profile_witnesses)
+
+# --- and its sample floor has to be reachable inside the intent window -------
+modest = {"pages": {"203.0.113.%d" % n: 3 for n in range(4)},
+          "assets": {"203.0.113.%d" % n: 9 for n in range(4)}}
+wm = audit_engine.AuditEngine(dict(cfg))
+wm._calibrate_client_profiling(modest)
+check("witness: 12 requests in the window is enough to judge a client",
+      wm.profile_witnesses == 4, wm.profile_witnesses)
+check("witness: so profiling survives a mixed host", wm.profiling is True)
+tiny = {"pages": {"203.0.113.9": 2}, "assets": {"203.0.113.9": 3}}
+wt = audit_engine.AuditEngine(dict(cfg))
+wt._calibrate_client_profiling(tiny)
+check("witness: but five requests is still too few to judge anyone",
+      wt.profile_witnesses == 0, wt.profile_witnesses)
+
+# --- the CSF pushed-record must seed from csf.deny, not from empty ------------
+seed_state = steady(os.path.join(work, "state_seed"))
+seed_cfg = dict(cfg)
+seed_cfg["STATE_DIR"] = seed_state
+seed_cfg["BLACKLIST"] = os.path.join(work, "blacklist_seed.txt")
+seed_cfg["CSF_DENY"] = write("csf_deny_seed.txt", "\n".join([
+    "# Copyright",
+    "78.153.140.39 # ReconScanner - Sat Aug 15 22:58:23 2026",
+    "20.251.112.238 # WebshellHunter - Mon Aug 17 17:30:30 2026",
+    "216.73.216.4 # CloudScraper | WebApp | Hits: 40x - Sun Aug 16 07:18:03 2026",
+    "185.20.30.40 # lfd: (PERMBLOCK) 185.20.30.40 has had more than 4 blocks",
+    "tcp|in|d=22|s=1.2.3.4 # a port rule, not an address",
+]) + "\n")
+seeded = apply_engine.ApplyEngine(seed_cfg).load_pushed_record()
+check("csf seed: logwall's own entries are recovered from csf.deny",
+      seeded == {"78.153.140.39", "20.251.112.238", "216.73.216.4"}, sorted(seeded))
+check("csf seed: an lfd entry is never claimed as ours",
+      "185.20.30.40" not in seeded, sorted(seeded))
+check("csf seed: a port rule is not mistaken for an address",
+      not any("|" in t for t in seeded), sorted(seeded))
+
+# so the orphans that predate the record are released on the very first run
+seed_engine = apply_engine.ApplyEngine(seed_cfg)
+seed_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, seed_entries = seed_engine.execute(dry_run=False)
+seed_out = os.path.join(work, "csf_release_seed.list")
+seed_engine.emit_csf_release(seed_out, seed_entries)
+released_seed = open(seed_out, encoding="utf-8").read().split()
+check("csf seed: entries CSF holds but the blacklist does not are released at once",
+      sorted(released_seed) == ["20.251.112.238", "216.73.216.4", "78.153.140.39"],
+      released_seed)
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")
