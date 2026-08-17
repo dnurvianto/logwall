@@ -1737,6 +1737,109 @@ check("profiling: and the message says how many clients were checked",
       "client(s) of" in (cdn_engine.flags_extra or ""), cdn_engine.flags_extra)
 
 
+# ============================================================== rc13 Fase 4
+#
+# R1 was measured, not imagined: 70 individual /64 entries sat under one accepted
+# /56 on a production host — 69% of that blacklist was redundant.
+
+sup_state = os.path.join(work, "state_sup")
+sup_cfg = dict(cfg)
+sup_cfg["STATE_DIR"] = steady(sup_state)
+sup_cfg["BLACKLIST"] = os.path.join(work, "blacklist_sup.txt")
+with open(sup_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
+    handle.write("# header\n")
+    handle.write("2a03:2880:f800::/56    # 2026-08-16 01:06 | Subnet6Flood | "
+                 "PERMANENT | strike=1 | expires=-\n")
+    for n in range(4):
+        handle.write("2a03:2880:f800:%d::/64    # 2026-08-16 00:52 | Subnet6Flood | "
+                     "PERMANENT | strike=1 | expires=-\n" % n)
+    handle.write("78.153.140.0/24    # 2026-08-16 09:18 | SubnetCoordinatedAttack | "
+                 "PERMANENT | strike=1 | expires=-\n")
+    handle.write("78.153.140.39    # 2026-08-15 22:56 | ReconScanner | "
+                 "PERMANENT | strike=1 | expires=-\n")
+    handle.write("203.0.113.200    # 2026-08-15 22:56 | ReconScanner | "
+                 "PERMANENT | strike=1 | expires=-\n")
+
+sup_engine = apply_engine.ApplyEngine(sup_cfg)
+sup_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, sup_entries = sup_engine.execute(dry_run=False)
+removed = [target for target, _parent in sup_engine.superseded]
+
+check("supersede: /64 members under an accepted /56 are removed",
+      "2a03:2880:f800:0::/64" in removed or "2a03:2880:f800::/64" in removed,
+      removed)
+check("supersede: all four redundant /64s go", len(
+      [r for r in removed if r.startswith("2a03")]) == 4, removed)
+check("supersede: the covering /56 stays", "2a03:2880:f800::/56" in sup_entries)
+check("supersede: an IPv4 member under an accepted /24 goes too",
+      "78.153.140.39" in removed, removed)
+check("supersede: the covering /24 stays", "78.153.140.0/24" in sup_entries)
+check("supersede: an unrelated address is untouched",
+      "203.0.113.200" in sup_entries, sorted(sup_entries))
+check("supersede: each removal names the entry that covers it",
+      all(parent for _t, parent in sup_engine.superseded),
+      sup_engine.superseded[:2])
+
+# --- a PERMANENT member must not be dropped in favour of a TEMP range ---------
+tier_cfg = dict(cfg)
+tier_cfg["STATE_DIR"] = steady(os.path.join(work, "state_tier"))
+tier_cfg["BLACKLIST"] = os.path.join(work, "blacklist_tier.txt")
+with open(tier_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
+    handle.write("45.148.10.0/24    # 2026-08-16 09:18 | Subnet | TEMP | "
+                 "strike=1 | expires=%d\n" % (int(time.time()) + 86400))
+    handle.write("45.148.10.238    # 2026-08-15 22:56 | ReconScanner | "
+                 "PERMANENT | strike=1 | expires=-\n")
+tier_engine = apply_engine.ApplyEngine(tier_cfg)
+tier_engine.audit.evaluate_candidates = lambda panel=None: {}
+_, tier_entries = tier_engine.execute(dry_run=False)
+check("supersede: a PERMANENT member survives a TEMP range that would expire",
+      "45.148.10.238" in tier_entries, sorted(tier_entries))
+
+# --- R1/CSF: removals must be released, not left in another agent's config -----
+rel_path = os.path.join(work, "csf_release.list")
+sup_engine.emit_csf_release(rel_path)
+released = open(rel_path, encoding="utf-8").read().split()
+check("csf: superseded members are queued for release from csf.deny",
+      "78.153.140.39" in released, released[:4])
+
+exp_cfg = dict(cfg)
+exp_cfg["STATE_DIR"] = steady(os.path.join(work, "state_exp"))
+exp_cfg["BLACKLIST"] = os.path.join(work, "blacklist_exp.txt")
+with open(exp_cfg["BLACKLIST"], "w", encoding="utf-8") as handle:
+    handle.write("198.18.51.9    # 2026-08-15 22:56 | CloudScraper | TEMP | "
+                 "strike=1 | expires=%d\n" % (int(time.time()) - 3600))
+exp_engine = apply_engine.ApplyEngine(exp_cfg)
+exp_engine.audit.evaluate_candidates = lambda panel=None: {}
+exp_engine.execute(dry_run=False)
+exp_rel = os.path.join(work, "csf_release_exp.list")
+exp_engine.emit_csf_release(exp_rel)
+check("csf: an expired TEMP block is released instead of living forever",
+      "198.18.51.9" in open(exp_rel, encoding="utf-8").read(),
+      open(exp_rel, encoding="utf-8").read().strip())
+
+# --- R5: no shipped setting may be unread by every code path ------------------
+repo = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+conf_text = open(os.path.join(repo, "conf", "logwall.conf"), encoding="utf-8").read()
+keys = set(re.findall(r"(?m)^([A-Z_0-9]+)=", conf_text))
+haystack = []
+for folder, _dirs, names in os.walk(repo):
+    if any(part in folder for part in (".git", "__pycache__", "docs")):
+        continue
+    for name in names:
+        if name in ("logwall.conf", "CHANGELOG.md") or name.endswith(".log"):
+            continue
+        if name.endswith((".py", ".sh", ".md")) or name == "logwall":
+            try:
+                haystack.append(open(os.path.join(folder, name),
+                                     encoding="utf-8", errors="ignore").read())
+            except OSError:
+                continue
+blob = "\n".join(haystack)
+orphans = sorted(k for k in keys if k not in blob)
+check("config: every shipped setting is read by some code path", orphans == [],
+      orphans)
+
+
 print()
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

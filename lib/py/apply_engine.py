@@ -144,6 +144,7 @@ class ApplyEngine:
         self.added = []
         self.expired = []
         self.escalated = []
+        self.superseded = []
 
     # ------------------------------------------------------------------ state
     def load_history(self):
@@ -240,6 +241,21 @@ class ApplyEngine:
             history[entry.target]["last"] = now
             self.added.append(entry)
 
+        # 4. Drop entries a wider accepted range already covers.
+        #
+        # evaluate_candidates() removes members covered by a range, but only among
+        # the candidates of a single run. Nothing ever revisited an entry that was
+        # ALREADY blocked when its covering range arrived later. Measured on a
+        # production host: 70 individual /64 entries sitting under one accepted
+        # /56 — 69% of that blacklist was redundant. Those happened to be TEMP and
+        # aged out; on a host where they are PERMANENT the list grows forever and
+        # eats ipset capacity for nothing.
+        #
+        # In CSF mode it is worse than wasted space: every redundant member is also
+        # a permanent line in another agent's config file, which that agent has no
+        # reason to ever clean up.
+        self.superseded = self._prune_superseded(entries)
+
         if dry_run:
             self.report(entries, dry_run=True)
             return EXIT_OK, entries
@@ -281,6 +297,51 @@ class ApplyEngine:
         except OSError:
             pass
 
+    def _prune_superseded(self, entries):
+        """
+        Removes entries wholly contained in another, wider entry.
+
+        Returns the list of removed targets so the caller can report them and, in
+        CSF mode, release them from csf.deny. Silence would be the wrong choice
+        here: an operator who finds seventy lines gone and no explanation has been
+        given a reason to distrust the tool.
+
+        A PERMANENT entry is never dropped in favour of a TEMP one — the wider
+        block would expire and leave the member unprotected.
+        """
+        if not get_bool(self.config, "PRUNE_SUPERSEDED", True):
+            return []
+
+        nets = {}
+        for target in entries:
+            try:
+                nets[target] = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                continue
+
+        ranges = [(t, n) for t, n in nets.items() if n.num_addresses > 1]
+        if not ranges:
+            return []
+
+        removed = []
+        for target, net in nets.items():
+            for parent_target, parent in ranges:
+                if parent_target == target or parent.version != net.version:
+                    continue
+                if net.num_addresses >= parent.num_addresses:
+                    continue
+                if not net.subnet_of(parent):
+                    continue
+                if (entries[target].tier == TIER_PERMANENT
+                        and entries[parent_target].tier == TIER_TEMP):
+                    continue
+                removed.append((target, parent_target))
+                break
+
+        for target, _parent in removed:
+            entries.pop(target, None)
+        return removed
+
     # ------------------------------------------------------------- event record
     def record_events(self, now):
         """
@@ -300,6 +361,9 @@ class ApplyEngine:
             rows.append({"ts": now, "action": "EXPIRED", "target": target})
         for target in self.escalated:
             rows.append({"ts": now, "action": "ESCALATE", "target": target})
+        for target, parent in self.superseded:
+            rows.append({"ts": now, "action": "SUPERSEDED", "target": target,
+                         "reason": "covered by " + parent})
         if not rows:
             return
 
@@ -430,6 +494,20 @@ class ApplyEngine:
             pass
         return known
 
+    def emit_csf_release(self, path):
+        """
+        Writes the addresses CSF should stop blocking, one per line.
+
+        Without this, `csf -d` was a one-way door: logwall dropped an expired TEMP
+        entry from its own blacklist and csf.deny kept it forever, which quietly
+        turned every temporary block on a CSF host into a permanent one. The
+        escalation ladder only means something if the bottom rung can be stepped
+        off. Redundant members removed by _prune_superseded() go the same way.
+        """
+        targets = list(self.expired) + [t for t, _parent in self.superseded]
+        _atomic_write(path, "\n".join(targets) + ("\n" if targets else ""))
+        return len(targets)
+
     def emit_csf_list(self, entries, path):
         """
         Writes 'ip<TAB>reason' for every blacklist entry CSF is not enforcing yet.
@@ -489,6 +567,9 @@ class ApplyEngine:
             print(f"{prefix}[EXPIRED] {target} — TEMP block elapsed, released")
         for target in self.escalated:
             print(f"{prefix}[ESCALATE] {target} — repeat offender promoted to PERMANENT")
+        for target, parent in self.superseded:
+            print(f"{prefix}[SUPERSEDED] {target} — already covered by {parent}, "
+                  f"removed as redundant")
 
         ddns = getattr(self.guard, "ddns", None)
         if ddns is not None:
@@ -512,7 +593,8 @@ class ApplyEngine:
             print(f"{prefix}{flags['SETTING_RENAMED']}")
 
         print(f"{prefix}[SUMMARY] new={len(self.added)} expired={len(self.expired)} "
-              f"escalated={len(self.escalated)} total={len(entries)}")
+              f"escalated={len(self.escalated)} superseded={len(self.superseded)} "
+              f"total={len(entries)}")
 
 
 def _atomic_write(path, content):
@@ -533,6 +615,8 @@ def main():
                         help="write an ipset restore script to PATH")
     parser.add_argument("--emit-csf", metavar="PATH",
                         help="write newly blocked entries as 'ip<TAB>reason' for CSF")
+    parser.add_argument("--emit-csf-release", metavar="PATH",
+                        help="write addresses CSF should stop blocking, one per line")
     args = parser.parse_args()
 
     engine = ApplyEngine()
@@ -543,6 +627,8 @@ def main():
             engine.emit_ipset_script(entries, args.emit_ipset)
         if args.emit_csf:
             engine.emit_csf_list(entries, args.emit_csf)
+        if args.emit_csf_release:
+            engine.emit_csf_release(args.emit_csf_release)
 
     return code
 

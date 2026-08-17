@@ -124,6 +124,30 @@ export SET_WHITE4 SET_BLACK4 SET_WHITE6 SET_BLACK6
 ENFORCE="${ENFORCE:-0}"
 
 # ------------------------------------------------------------------- apply flow
+# Releases addresses CSF should stop blocking: expired TEMP entries and members a
+# wider range now covers.
+#
+# Without this, `csf -d` was a one-way door. logwall removed an expired TEMP entry
+# from its own blacklist and csf.deny kept it forever, which turned every temporary
+# block on a CSF host into a permanent one. An escalation ladder only means
+# something if the bottom rung can be stepped off.
+_csf_release() {
+    local list_file="$1"
+    local released=0 ip
+
+    [ -s "$list_file" ] || return 0
+
+    while IFS= read -r ip || [ -n "${ip:-}" ]; do
+        [ -n "$ip" ] || continue
+        if csf -dr "$ip" >/dev/null 2>&1; then
+            released=$((released + 1))
+        fi
+    done < "$list_file"
+
+    [ "$released" -gt 0 ] && say "[CSF] Released ${released} address(es)."
+    return 0
+}
+
 # Feeds newly detected addresses to CSF. CSF owns the blocklist in this mode, so
 # logwall installs no chains of its own — CSF flushes iptables on every reload and
 # would tear them out anyway.
@@ -221,11 +245,12 @@ cmd_apply() {
 
     ipset_script="${STATE_DIR}/ipset_restore.script"
     local csf_list="${STATE_DIR}/csf_push.list"
+    local csf_release="${STATE_DIR}/csf_release.list"
     mkdir -p "$STATE_DIR" 2>/dev/null || true
 
     local py_args=()
     if [ "$csf_mode" -eq 1 ]; then
-        py_args=(--emit-csf "$csf_list")
+        py_args=(--emit-csf "$csf_list" --emit-csf-release "$csf_release")
     else
         py_args=(--emit-ipset "$ipset_script")
     fi
@@ -251,6 +276,10 @@ cmd_apply() {
         # the push is the one action gated on ENFORCE in this mode.
         if [ "$ENFORCE" = "1" ]; then
             _csf_push "$csf_list" || say "[WARN] Some addresses could not be pushed to CSF."
+            # Releases are safe regardless of ENFORCE, but running them only in
+            # this branch keeps the two halves of the ladder symmetrical: a host
+            # that never pushed has nothing of ours to release.
+            _csf_release "$csf_release"
         else
             # `grep -c` prints 0 and THEN exits 1, so `|| echo 0` would emit a
             # second line and the message would break across two lines.
