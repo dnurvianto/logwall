@@ -248,7 +248,8 @@ class IPGuard:
             enabled=get_bool(config, "FCRDNS_VERIFY", True),
             timeout=get_int(config, "FCRDNS_TIMEOUT_SEC", 3),
             cache_days=get_int(config, "FCRDNS_CACHE_DAYS", 30),
-            max_lookups=get_int(config, "FCRDNS_MAX_LOOKUPS_PER_RUN", 100),
+            max_lookups=get_int(config, "FCRDNS_MAX_LOOKUPS_PER_RUN", 400),
+            max_seconds=get_int(config, "FCRDNS_MAX_SECONDS_PER_RUN", 10),
             resolver=resolver)
 
     def _in(self, ip_obj, networks):

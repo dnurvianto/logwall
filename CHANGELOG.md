@@ -326,7 +326,13 @@ data killed it within the hour, twice:
                    ever have matched it.
 
 There is no reliable signal for which entries deserve a lookup, and inventing one
-only decided which mistakes stayed in place longest. The budget and the cache carry
+only decided which mistakes stayed in place longest.
+
+The lookup budget is a clock rather than a count, for the same reason. A count has to
+be tuned against a latency nobody knows in advance: measured on one host with a
+healthy resolver, 0.06s per lookup — a cap of 50 there left a 1,325-entry blacklist
+draining over 27 cycles for nothing, while on a host whose resolver had stopped
+answering the same 50 would have cost 150 seconds. A time budget needs no tuning. The budget and the cache carry
 this instead: one lookup per address per FCRDNS_CACHE_DAYS, so successive runs advance
 through a legacy list rather than re-walking it. At the default budget a 1,300-entry
 blacklist finishes inside a quarter of an hour of cycles. Cheap in the steady state: the other guards are list

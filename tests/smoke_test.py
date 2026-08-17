@@ -2278,7 +2278,36 @@ fc = fcrdns.FCrDNS(fo.state_dir, resolver=fake_resolver)
 check("fcrdns: the cache is reloaded from disk",
       fc.verify("40.77.167.123")[0] and fc.lookups == 0, fc.lookups)
 
-# a broken resolver cannot stall a run
+# a broken resolver cannot stall a run: the CLOCK is the real budget
+slow_calls = []
+
+
+def slow_resolver(ip, timeout):
+    slow_calls.append(ip)
+    time.sleep(0.4)
+    return None, set(), True          # resolver never answers
+
+
+ft = fcrdns.FCrDNS(os.path.join(work, "state_fc_time"), resolver=slow_resolver,
+                   max_lookups=1000, max_seconds=1)
+os.makedirs(ft.state_dir, exist_ok=True)
+for n in range(40):
+    ft.verify("198.51.100.%d" % n)
+check("fcrdns: a dead resolver is cut off by the time budget, not by a count",
+      ft.exhausted and ft.lookups <= 4, (ft.lookups, ft.exhausted))
+check("fcrdns: so a stalled run costs about the budget, not 40 timeouts",
+      len(slow_calls) <= 4, len(slow_calls))
+
+# and a fast resolver is allowed to get through plenty inside the same budget
+ff = fcrdns.FCrDNS(os.path.join(work, "state_fc_fast"), resolver=fake_resolver,
+                   max_lookups=1000, max_seconds=5)
+os.makedirs(ff.state_dir, exist_ok=True)
+for n in range(200):
+    ff.verify("198.51.100.%d" % n)
+check("fcrdns: a healthy resolver spends the same budget on hundreds of lookups",
+      ff.lookups == 200 and not ff.exhausted, (ff.lookups, ff.exhausted))
+
+# the count remains a second ceiling
 fb = verifier("fc3", max_lookups=2)
 for n in range(6):
     fb.verify("198.51.100.%d" % n)

@@ -76,12 +76,22 @@ class FCrDNS:
     """
 
     def __init__(self, state_dir, enabled=True, timeout=3, cache_days=30,
-                 max_lookups=50, resolver=None):
+                 max_lookups=400, max_seconds=10, resolver=None):
         self.enabled = enabled
-        # A cap on UNCACHED lookups per run. Every one of them is a network round
-        # trip, and a resolver that has stopped answering would otherwise turn a
-        # two-second run into a two-minute one, every two minutes, forever.
+        # Two budgets, and the clock is the one that matters.
+        #
+        # A count alone is the wrong instrument: it has to be tuned against a
+        # latency nobody knows in advance. Measured on one host with a healthy
+        # resolver, 0.06s per lookup — a cap of 50 there left a 1,325-entry
+        # blacklist draining over 27 cycles for no reason, while on a host whose
+        # resolver had stopped answering the same 50 would have cost 150 seconds.
+        #
+        # A time budget needs no tuning: fast DNS spends it on hundreds of lookups,
+        # a dead resolver spends it on three and stops. The count stays as a second
+        # ceiling so a very fast resolver cannot be walked indefinitely.
         self.max_lookups = max(0, int(max_lookups))
+        self.max_seconds = max(1, int(max_seconds))
+        self.started = time.time()
         self.timeout = max(1, int(timeout))
         self.cache_ttl = max(1, int(cache_days)) * 86400
         self.path = os.path.join(state_dir, "rdns_cache.json")
@@ -146,7 +156,8 @@ class FCrDNS:
         if record is not None:
             return bool(record.get("ok")), record.get("host")
 
-        if self.lookups >= self.max_lookups:
+        if (self.lookups >= self.max_lookups
+                or time.time() - self.started >= self.max_seconds):
             self.exhausted = True
             return False, None
 
