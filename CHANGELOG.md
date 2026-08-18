@@ -2,6 +2,74 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc14 — 2026-08-18 (a path named vendor is not evidence)
+
+One false positive, found the way they should be found: an operator reported that
+their office could not reach the site.
+
+### A WordPress page load looked like four probes
+
+`103.184.180.1` — a court office, Firefox 115, reading a hearing calendar — was
+blocked PERMANENT sixty seconds after it arrived. Every one of its 119 requests was
+answered 200. The evidence against it was four files:
+
+```
+/wp-includes/js/dist/vendor/moment.min.js?ver=2.30.1
+/wp-includes/js/dist/vendor/react.min.js?ver=18.3.1.1
+/wp-includes/js/dist/vendor/react-dom.min.js?ver=18.3.1.1
+/wp-includes/js/dist/vendor/react-jsx-runtime.min.js?ver=18.3.1
+```
+
+`sensitive_pattern` carried a bare `/vendor/`, aimed at an exposed Composer
+directory. WordPress core ships React and Moment under that name, so one page load
+produced four "probes" against a threshold of two.
+
+The token stays; what changed is that a path ending in a static asset extension no
+longer counts as a probe. `/vendor/…/eval-stdin.php`, `/vendor/composer/installed.json`
+and `/vendor/.env` are still caught wherever they sit, because the exploit is never
+a `.js` file.
+
+Anchoring the pattern to `^/vendor/` was the obvious alternative and was rejected:
+Composer directories live under subdirectories on plenty of hosts, and that fix
+would have traded one blind spot for another.
+
+### The cost of that fix, stated rather than hidden
+
+The same change lets one real bot walk. A JavaScript harvester calling itself
+`JSHunt/2.0` was caught on another host by the same `/vendor/` token, and by nothing
+else: seven requests is under every volume threshold, `.js` is not a source file, and
+its three successful fetches satisfy the behavioural veto in `_looks_like_a_client()`
+— the veto that exists to protect real visitors and was doing its job.
+
+So `jshunt` joins `ATTACK_UA_MARKERS`, where a name is the admission of intent. This
+catches a bot that is honest about itself and stops the day its operator edits one
+line. It is hygiene, not a defence, and it is not worth more than one line.
+
+Two better-sounding rules were considered and rejected. **Referer-less asset
+requests**: a single `Referrer-Policy: no-referrer` header on the protected site
+makes every genuine visitor look identical to the bot — a silent, site-wide false
+positive in exchange for catching seven requests. **Asset-mix profiling** (JavaScript
+fetched with no stylesheets or images): defeated by HTTP caching, which is what a
+returning visitor does every day.
+
+`_looks_like_a_client()` was left untouched. It is the guard that spared five real
+visitors in the case rc13 was built around, and loosening it to catch a harvester of
+public files would trade proven protection for nothing.
+
+### Also
+
+- `WHITELIST-DOUBLE-BACKUP` is documented in `docs/DESIGN.md` §7 as a second layer
+  behind the whitelist ipset. No code in this repository creates those rules. Where
+  they survive from an older install they sit *below* the block hook in `INPUT` and
+  cannot accept a packet the blacklist has already dropped — which is exactly how
+  this report reached us as "I thought I had whitelisted it". Not touched here; the
+  gap is named so the next release can close it in one direction or the other.
+
+### Tests
+
+341 → 352 offline checks. The bundled-asset paths that caused the block are fixtures
+now, alongside the probes that must survive the exemption.
+
 ## 1.0.0-rc13 — 2026-08-17 (say what the run did; stop believing what clients claim)
 
 Twelve findings, every one of them measured on a live host rather than reasoned

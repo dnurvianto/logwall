@@ -120,8 +120,16 @@ SCRIPT_UA_GENERIC = (
 # without inheriting the generic list.
 ATTACK_UA_MARKERS = (
     "masscan", "nuclei", "zgrab", "nikto", "sqlmap", "wpscan", "dirbuster",
-    "gobuster", "feroxbuster",
+    "gobuster", "feroxbuster", "jshunt",
 )
+
+# `jshunt` earns its place the same way the rest do, and its limit is worth
+# stating: this catches a bot that is honest about itself, and stops catching it
+# the day its operator edits one line. It is hygiene, not a defence. Seen in the
+# field 2026-08-18 harvesting bundled JavaScript for leaked keys — seven requests,
+# three of them answered 200, which is exactly what made the behavioural veto in
+# audit_engine._looks_like_a_client() read it as a visitor. The name is the only
+# evidence that survives that veto.
 
 # Profiling treats both halves the same: an attack tool is also a script. The
 # union keeps browser-vs-script classification byte-for-byte identical to before
@@ -646,6 +654,19 @@ class LogParserEngine:
             r"\.DS_Store|config\.json|\.npmrc|\.dockercfg|docker-compose\.ya?ml|"
             r"/phpinfo|/adminer|\.old$|\.orig$",
             re.IGNORECASE)
+
+        # `/vendor/` is the one token in that list a browser can reach by
+        # accident: WordPress core ships React and Moment under
+        # /wp-includes/js/dist/vendor/, so one ordinary page load looks like four
+        # probes. Measured in the field 2026-08-18 — an office address reading a
+        # court calendar in Firefox, every request answered 200, blocked
+        # PERMANENT sixty seconds later.
+        #
+        # A static asset is never the evidence. /vendor/…/eval-stdin.php is still
+        # caught wherever it sits, because the exploit is never a .js file.
+        self.sensitive_asset_exempt = re.compile(
+            r"\.(?:js|mjs|css|map|png|jpe?g|gif|svg|webp|avif|ico|"
+            r"woff2?|ttf|otf|eot)$", re.IGNORECASE)
 
         # A request for a SOURCE file that returned 404.
         #
@@ -1201,7 +1222,9 @@ class LogParserEngine:
                 if "xmlrpc.php" in uri:
                     self.window.add(ip, "xmlrpc", 1, stamp)
                 if self.sensitive_pattern.search(uri):
-                    self.window.add(ip, "scan", 1, stamp)
+                    sens_path = uri.split("?", 1)[0].split("#", 1)[0]
+                    if not self.sensitive_asset_exempt.search(sens_path):
+                        self.window.add(ip, "scan", 1, stamp)
                 if status in (401, 403):
                     self.window.add(ip, "p401", 1, stamp)
                 if status == 404:

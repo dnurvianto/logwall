@@ -1079,6 +1079,16 @@ check("attack ua: an absent agent is NOT an attack signature",
       not log_parser.classify_attack_ua("-") and not log_parser.classify_attack_ua(""))
 check("attack ua: generic clients still count toward profiling",
       log_parser.classify_user_agent("curl/8.5.0"))
+check("attack ua: jshunt is one, even wrapped in a browser string",
+      log_parser.classify_attack_ua("Mozilla/5.0 (compatible; JSHunt/2.0)"))
+check("attack ua: a real Firefox string is NOT",
+      not log_parser.classify_attack_ua(
+          "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:109.0) "
+          "Gecko/20100101 Firefox/115.0"))
+v = verdict_for("aua_veto", {"45.10.20.12": {"hits": 7, "aua": 5, "ok": 3,
+                                             "assets": 6, "pages": 1}})
+check("attack ua: the name outranks the looks-like-a-client veto",
+      "ToolSignature" in v.get("45.10.20.12", {}).get("reason", ""), sorted(v))
 v = verdict_for("aua", {"45.10.20.10": {"hits": 3, "aua": 1}})
 check("attack ua: one request is enough",
       "ToolSignature" in v.get("45.10.20.10", {}).get("reason", ""), sorted(v))
@@ -1120,6 +1130,24 @@ for probe in ("/wp-config.php", "/.ssh/id_rsa", "/.aws/credentials",
 check("sensitive: /.well-known/ is NOT - ACME renewal lives there",
       not sensitive_pe.sensitive_pattern.search(
           "/.well-known/acme-challenge/tokenvalue"))
+
+# The pattern still matches these; the asset exemption is what spares them, and
+# it is applied where "scan" is counted. Field case 2026-08-18: an office address
+# blocked PERMANENT for loading one WordPress page.
+for asset in ("/wp-includes/js/dist/vendor/react.min.js",
+              "/wp-includes/js/dist/vendor/moment.min.js",
+              "/wp-content/plugins/x/vendor/style.css",
+              "/assets/vendor/fonts/icons.woff2"):
+    check("sensitive: bundled asset " + asset + " is not a probe",
+          bool(sensitive_pe.sensitive_asset_exempt.search(asset)))
+check("sensitive: the query string does not defeat the asset exemption",
+      bool(sensitive_pe.sensitive_asset_exempt.search(
+          "/wp-includes/js/dist/vendor/react.min.js?ver=18.3.1".split("?")[0])))
+for probe in ("/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+              "/vendor/composer/installed.json", "/vendor/.env"):
+    check("sensitive: " + probe + " survives the asset exemption",
+          bool(sensitive_pe.sensitive_pattern.search(probe))
+          and not sensitive_pe.sensitive_asset_exempt.search(probe))
 
 # --- N6 bandwidth at the /56 tier -------------------------------------------
 wide_bw = {}

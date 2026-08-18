@@ -363,7 +363,7 @@ logwall uninstall [--purge]       Clean removal, verified
 No root, no firewall, no network. Everything runs in a temp directory.
 
 ```bash
-python3 tests/smoke_test.py       # 341 checks: parsers, window, subnets, profiling, guards, escalation
+python3 tests/smoke_test.py       # 352 checks: parsers, window, subnets, profiling, guards, escalation
 bash    tests/gate_test.sh        #  72 checks: the gate refuses what it must
 bash    tests/lineending_test.sh  #   1 check: CRLF would break every script on Linux
 ```
