@@ -64,6 +64,7 @@ export STATE_DIR SNAPSHOT_DIR PYTHONPATH="${LOGWALL_ROOT}/lib/py:${PYTHONPATH:-}
 . "${LOGWALL_ROOT}/lib/process_lock.sh"
 . "${LOGWALL_ROOT}/lib/chain_manager.sh"
 . "${LOGWALL_ROOT}/lib/firewall_wrapper.sh"
+. "${LOGWALL_ROOT}/lib/webserver_guard.sh"
 . "${LOGWALL_ROOT}/lib/rule_snapshot.sh"
 . "${LOGWALL_ROOT}/lib/cron_manager.sh"
 . "${LOGWALL_ROOT}/lib/deadman.sh"
@@ -303,6 +304,11 @@ cmd_apply() {
 
         # Whitelist is installed before the blacklist can ever match.
         setup_iptables_chains "$ENFORCE"
+
+        # Second enforcement point: iptables can only match a packet's real
+        # source, which behind a CDN is always the edge, never the attacker.
+        # This checks the address nginx's own realip module already recovered.
+        webserver_guard_apply "$ENFORCE"
 
         if [ "$ENFORCE" != "1" ]; then
             say "[INFO] ENFORCE=0 — sets populated for review, no traffic is being dropped."
@@ -614,6 +620,7 @@ cmd_selftest() {
                 fw_init_sets "${IPSET_MAXELEM:-262144}" || true
                 setup_iptables_chains "$ENFORCE"
             fi
+            webserver_guard_apply "$ENFORCE"
             deadman_check_stale "${CONFIRM_TIMEOUT_SEC:-300}" "${LOGWALL_ROOT}/logwall" || true
         fi
 
@@ -628,6 +635,8 @@ cmd_selftest() {
             chain_selftest "$ENFORCE"
             failures=$((failures + $?))
         fi
+        webserver_guard_selftest "$ENFORCE"
+        failures=$((failures + $?))
         cron_selftest || failures=$((failures + 1))
         detect_foreign_blockers || echo "[INFO] Coexisting agent detected (reported, not modified)."
         report_ipv6_exposure || true
@@ -979,6 +988,7 @@ case "$SUBCOMMAND" in
             panic)
                 echo "[EMERGENCY] Detaching every logwall hook..."
                 panic_remove_chains
+                webserver_guard_panic
                 rm -f "${DEADMAN_STATE_DIR}/deadman.marker" 2>/dev/null || true
                 echo "[EMERGENCY] Done. logwall no longer touches this ruleset."
                 echo "[EMERGENCY] Other tools' rules (panel, CSF, fail2ban, Docker) were left intact."

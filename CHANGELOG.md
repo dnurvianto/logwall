@@ -2,6 +2,56 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc16 — 2026-08-20 (a correct block that never reaches the packet)
+
+### Blacklisted, and still answering the attacker for five hours
+
+`docs/DESIGN.md` §8.F has said since before this repository's own history that an L3 block on a
+CDN-fronted site's real address does not stop the traffic — the packets still arrive from the CDN
+edge — and that enforcement has to happen at the CDN or in the web server instead. It reported the
+gap as `ENFORCEMENT_ELSEWHERE`. Nothing implemented either half: `ENFORCEMENT_ELSEWHERE` was never
+emitted by any code path, and `CDN_NO_REALIP_POLICY` — the config key for the fail-safe half of
+the same story — was one of sixteen phantom settings removed in rc13 for the same reason: "a
+switch an operator could set, and believe, that no code path ever consulted."
+
+Found the way rc14's whitelist gap was found — on a live host, not by reading the doc. An address
+was correctly detected and blacklisted PERMANENT for `PanelBruteForce` at 02:14. It was still
+reaching the backend and getting normal 301/404 responses at 07:36 — over five hours later —
+scanning `/inc/data/database.sdb`, `/index/install`, `/manager/html`, `/jmx-console/` across
+dozens of unrelated product signatures. `LOGWALL_BLOCK` had dropped 26 packets total against 182
+blacklisted addresses. The detection was never wrong. Every one of that address's packets
+physically arrived from a Cloudflare edge IP — `iptables -s <address> -j DROP` was never going to
+match a source address the kernel never actually saw.
+
+### `webserver_guard.sh` — the enforcement the doc always said had to happen elsewhere
+
+nginx's own `realip` module already recovers the address this needs — the same recovery the log
+parser already reads. `geo $remote_addr $logwall_blocked` built from the same blacklist file gives
+nginx a second, independent way to reject that address — `if ($logwall_blocked) { return 403; }` —
+before the request reaches the backend at all. Same detection, same blacklist, a second door with
+the same lock, not a new gate with new rules.
+
+Regenerated and reloaded every apply cycle, alongside the kernel side; never reloads on a config
+that fails `nginx -t` — stays on the last-known-good config rather than risk breaking every site on
+the host over one bad line, the same fail-safe already applied to the kernel side. On FastPanel
+this reaches every vhost with zero manual steps, through the shared `fastpanel2-includes/*.conf`
+directory already loaded inside every generated server block. Anywhere else the snippet is written
+and ready, but wiring it into a hand-built vhost is left to the operator — there is no safe,
+generic way to locate or edit an arbitrary vhost file without risking exactly the outage this
+project exists to prevent. Wired into `chain_selftest` and `firewall panic` alongside the kernel
+side. New setting: `WEBSERVER_ENFORCE` (default `1`).
+
+### A limit this does not close, named rather than implied
+
+An attacker routing through a Cloudflare zone (or Worker) this host does not administer — to reach
+this origin while hiding behind a shared edge IP that is not one of this host's own CDN-fronted
+visitors — is unaffected by any of the above. Blocking that shared edge IP would be blocking
+Cloudflare itself; `CDN_GUARD_HIT` already refuses exactly that, correctly. Closing that path needs
+a different mechanism — restricting the origin to accept only authenticated pulls from the zone
+actually in front of it (Cloudflare Authenticated Origin Pulls, mTLS) — and is out of scope here.
+This release answers "we detected an attacker behind our own CDN, now enforce it," not "who is
+allowed to speak to the origin at all."
+
 ## 1.0.0-rc15 — 2026-08-20 (a rule that only exists in the docs blocks nothing)
 
 ### The dual protection whitelist was never built

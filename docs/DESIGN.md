@@ -552,11 +552,31 @@ most severe failure mode, and it is handled in three layers:
    (`CDN_NO_REALIP_POLICY`), with concrete instructions for adding the field to `log_format`.
    Better to block nothing than to take the site down.
 
-**A limit that must be stated explicitly in the report:** for a CDN-fronted site, an L3 block on
-the real address **does not stop the traffic** — the packets still arrive from the CDN edge.
-Enforcement has to happen at the CDN (firewall rules) or in the web server (`deny`). logwall
-reports this as `ENFORCEMENT_ELSEWHERE` so the admin does not mistakenly believe they are
-protected.
+**The limit this used to only state, and now closes:** for a CDN-fronted site, an L3 block on the
+real address **does not stop the traffic** — the packets still arrive from the CDN edge, so
+`iptables`/`ipset` can detect the real address correctly and still drop nothing. Measured on a
+live host: an address blacklisted for `PanelBruteForce` kept reaching the backend for 5+ hours
+afterward, answered normally (301/404), because every one of its packets physically arrived from
+a Cloudflare edge IP.
+
+`webserver_guard.sh` is the enforcement that has to happen in the web server, delivered: nginx's
+own `realip` module already recovers the address this needs (that recovery is what layer 2 above
+reads too), so a `geo $remote_addr $logwall_blocked` block built from the same blacklist file
+gives nginx a second, independent way to reject it — `if ($logwall_blocked) { return 403; }` —
+before the request ever reaches the backend. Same detection, same blacklist file, a second door
+with the same lock. On FastPanel this reaches every vhost automatically, through the shared
+`fastpanel2-includes/*.conf` directory already loaded inside every generated server block;
+elsewhere the snippet is written and ready, but wiring it into a hand-built vhost is left to the
+operator — there is no safe, generic way to locate or edit an arbitrary vhost file without risking
+the outage this project exists to prevent. Toggle: `WEBSERVER_ENFORCE` (default `1`).
+
+This does not reach a CDN-relayed attacker who is not actually one of this host's own CDN-fronted
+visitors — someone routing through a Cloudflare zone (or Worker) *we* do not administer, to reach
+this origin while hiding behind a shared edge IP. Blocking that shared IP would be blocking
+Cloudflare itself. Closing that path is a different mechanism entirely — restricting the origin to
+only accept authenticated pulls from the zone actually in front of it (e.g. Cloudflare
+Authenticated Origin Pulls, mTLS) — and is out of scope here: this module answers "we detected an
+attacker behind our own CDN, now enforce it," not "who is allowed to speak to the origin at all."
 
 ### G. Log Formats Across Web Servers (not just different paths — different structures)
 
