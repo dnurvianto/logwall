@@ -570,6 +570,21 @@ elsewhere the snippet is written and ready, but wiring it into a hand-built vhos
 operator — there is no safe, generic way to locate or edit an arbitrary vhost file without risking
 the outage this project exists to prevent. Toggle: `WEBSERVER_ENFORCE` (default `1`).
 
+**OpenLiteSpeed gets the same enforcement, by a different mechanism — three live-verified failures
+first.** There is no `geo`/`map` equivalent, and `RewriteMap` (the closest analogue, a file lookup)
+is rejected outright by the engine (`[ERROR] rewrite: invalid rewrite condition while parsing`) —
+not a config mistake, this build's rewrite engine does not carry the directive. `accessControl {
+allow ALL; deny <address> }`, the pattern LiteSpeed's own documentation describes as correct for
+exactly this, blocked nothing either — reloaded, then `fullrestart`ed, tested with a real request
+both times. What works, verified the same way: `RewriteCond %{REMOTE_ADDR} ^(addr1|addr2|...)$` +
+`RewriteRule .* - [F,L]` inside an already-active `rewrite { enable 1 }` block. IPv4 only for
+now — bare addresses and CIDR on a byte boundary (`/8`,`/16`,`/24`,`/32`), every width the subnet
+rollup produces; IPv6 and non-byte-aligned CIDR are skipped and counted rather than guessed at in a
+regex dialect never verified against this engine. No shared includes directory reaches every
+CyberPanel vhost the way FastPanel's does, so each `vhost.conf` is edited directly — but only ones
+that already carry an active `rewrite { enable 1 }` block; one that does not is left alone and
+counted, the same choice made for a hand-built nginx vhost.
+
 This does not reach a CDN-relayed attacker who is not actually one of this host's own CDN-fronted
 visitors — someone routing through a Cloudflare zone (or Worker) *we* do not administer, to reach
 this origin while hiding behind a shared edge IP. Blocking that shared IP would be blocking

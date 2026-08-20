@@ -2,6 +2,54 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc17 — 2026-08-20 (three wrong mechanisms before the one that worked)
+
+### The nginx-layer guard was nginx-only; the gap it closes is not
+
+rc16 closed the CDN enforcement gap for nginx. The gap itself — a blacklisted address correctly
+detected but never actually dropped, because every packet arrives from the CDN edge and not the
+attacker — has nothing to do with which webserver happens to be running. Calling rc16 "not
+supported on LiteSpeed" as though that were a settled limitation was wrong; it was simply not
+built yet, on a project whose own support matrix has named LiteSpeed since before this repository's
+history.
+
+### Three live-verified failures before the one that worked
+
+Not reasoned about, not assumed from documentation — three real config changes on a live
+OpenLiteSpeed host, each reloaded, tested with a real request, and reverted:
+
+1. **`accessControl { allow ALL; deny <address> }` at the server level** — the pattern LiteSpeed's
+   own docs describe as correct for exactly this. Reloaded, `fullrestart`ed. Blocked nothing,
+   either way.
+2. **`RewriteMap` (file-lookup, the nginx `geo`+`include` analogue)** — rejected outright:
+   `[ERROR] rewrite: invalid rewrite condition while parsing`. Not a config mistake; this build's
+   rewrite engine does not have the directive.
+3. **`RewriteCond`/`RewriteRule` with a literal regex** — worked. `403` with the address blocked,
+   `200` the moment it was not, verified with `curl` against a real vhost each time, not inferred
+   from config being present.
+
+### `webserver_guard.sh` — LiteSpeed side
+
+Regex alternation is what a scanned list has to become without `RewriteMap`: one `RewriteCond
+%{REMOTE_ADDR} ^(addr1|addr2|...)$` covering every BLACKLIST entry, built fresh each apply cycle.
+IPv4 only for now — bare addresses and CIDR on a byte boundary (`/8`, `/16`, `/24`, `/32`, every
+width logwall's own subnet rollup produces). IPv6 and non-byte-aligned CIDR are skipped and the
+skip count is reported, rather than guessed at in a regex dialect never verified against this
+engine.
+
+No FastPanel-style shared includes directory reaches every CyberPanel vhost automatically, so each
+`vhost.conf` is edited directly — but only ones that already carry an active `rewrite { enable 1
+}` block. A vhost without one is left alone and counted, the same choice already made for a
+hand-built nginx vhost: turning rewriting on for a site that does not already have it on is a
+behaviour change nobody asked for.
+
+Two bugs caught by testing the fix, not just the feature: `awk -v` processes backslash escapes in
+its own value, so a plain `-v pat="a\.b"` silently becomes `a.b` — turning "match a literal dot"
+into "match anything." Doubling every backslash before it reaches `-v` is what survives that pass
+intact. And the first version folded an ELIGIBLE/SKIP marker into the same stream as awk's own
+diagnostics; one unrelated warning line was enough to make every vhost read as ineligible. The two
+concerns don't share a channel now.
+
 ## 1.0.0-rc16 — 2026-08-20 (a correct block that never reaches the packet)
 
 ### Blacklisted, and still answering the attacker for five hours
