@@ -24,6 +24,12 @@ CHAIN_WL="${CHAIN_WL:-LOGWALL_WL}"
 CHAIN_BLOCK="${CHAIN_BLOCK:-LOGWALL_BLOCK}"
 CHAIN_RATE="${CHAIN_RATE:-LOGWALL_RATE}"
 
+# Tags the static per-address ACCEPT rules installed directly in INPUT by
+# setup_admin_whitelist_backup() (lib/chain_manager.sh) — never a chain, so it
+# is not prefixed like the names above; it identifies individual rules the
+# same way CHAIN_WL identifies a jump.
+ADMIN_BACKUP_COMMENT="${ADMIN_BACKUP_COMMENT:-LOGWALL_ADMIN_BACKUP}"
+
 # Names logwall must never create, swap, flush, or destroy. These belong to
 # first-generation blocker scripts and to other security tools.
 # chain_DENY / chain_ALLOW (and their _6_ variants) are the sets CSF creates.

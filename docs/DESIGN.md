@@ -662,9 +662,16 @@ Basic practices that must be present in every cycle:
 - **Kernel ipset comment metadata:** the blacklist is stored in a file
   (`IP # YYYY-MM-DD HH:MM | Reason`) and pushed directly into the kernel ipset
   (`hash:net comment`), so `ipset list` shows exactly the same metadata.
-- **Dual protection whitelist:** besides the `WHITELIST_SET` ipset, admin addresses are injected
-  as individual ACCEPT rules at the top of the `iptables` chain (`WHITELIST-DOUBLE-BACKUP`) to
-  prevent an accidental lockout.
+- **Dual protection whitelist:** besides the `LOGWALL_WL4`/`LOGWALL_WL6` ipset, every whitelist
+  address is also injected as an individual `-s <address> -j ACCEPT` rule (comment
+  `LOGWALL_ADMIN_BACKUP`), installed by `setup_admin_whitelist_backup()`
+  (`lib/chain_manager.sh`) at INPUT position 1 — ahead of `LOGWALL_WL`, `LOGWALL_BLOCK` and
+  `LOGWALL_RATE`. Position is not incidental: a backup rule below `LOGWALL_BLOCK` protects
+  nothing, because a blacklisted packet is already gone before reaching it. The two mechanisms
+  fail independently — an ipset flushed, destroyed, or rebuilt empty mid-cycle cannot take the
+  static rule with it — which is what an accidental lockout actually looks like: the jump to
+  `LOGWALL_WL` is still there, `iptables -L` still looks correct, and the packet falls through to
+  whatever comes next anyway. Toggle: `WHITELIST_DOUBLE_BACKUP` (default `1`).
 - **Guaranteed public port rules:** the public web ports (80, 443 TCP and UDP QUIC) and DNS
   (53 TCP/UDP) are re-inserted after the blacklist DROP rule on every cycle, keeping the site
   online with no risk from an iptables flush.

@@ -2,6 +2,35 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc15 — 2026-08-20 (a rule that only exists in the docs blocks nothing)
+
+### The dual protection whitelist was never built
+
+`docs/DESIGN.md` §10 has described this since before this repository's own history: besides the
+whitelist ipset, admin addresses get a second, independent ACCEPT path — an individual rule
+matched on the source address alone, so an ipset failure cannot take it down too. rc14 named the
+gap rather than closing it (`WHITELIST-DOUBLE-BACKUP` — no code in this repository creates those
+rules) after a report that traced back to exactly this: an operator found the rules on a live
+host, positioned *below* `LOGWALL_BLOCK` where a blacklisted packet is already gone before
+reaching them, left there by a legacy blocker script logwall had replaced. Neither the position
+nor the rules themselves were ever logwall's own doing.
+
+`setup_admin_whitelist_backup()` (`lib/chain_manager.sh`) builds it now: one `-s <address> -j
+ACCEPT` rule per whitelist entry, tagged `LOGWALL_ADMIN_BACKUP`, inserted at INPUT position 1 —
+ahead of `LOGWALL_WL`, `LOGWALL_BLOCK` and `LOGWALL_RATE`, and ahead of whatever another manager
+(ufw, firewalld) put there before logwall ran. Idempotent, family-aware (IPv4 and IPv6), and
+self-cleaning: an address removed from the whitelist file has its backup rule removed on the next
+apply, so it can never keep working through the very mechanism meant to be independent of that
+file's enforcement. `chain_selftest` now checks for it, and `panic_remove_admin_backup` tears it
+down along with everything else `logwall firewall panic` detaches. New setting:
+`WHITELIST_DOUBLE_BACKUP` (default `1`).
+
+Verified on a live host, not reasoned about: with `LOGWALL_WL4` flushed to zero members, a brand
+new SSH connection from a whitelisted address was still accepted — the backup rule's packet
+counter moved, `LOGWALL_WL`'s ipset match could not have fired against an empty set. An existing
+session proves nothing here, the same way it proves nothing after `firewall apply`; this was a
+fresh connection against a chain that had nothing else to accept it.
+
 ## 1.0.0-rc14 — 2026-08-18 (a path named vendor is not evidence)
 
 One false positive, found the way they should be found: an operator reported that
