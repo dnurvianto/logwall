@@ -2,6 +2,19 @@
 
 Every significant change to logwall. Versions follow [SemVer](https://semver.org/).
 
+## 1.0.0-rc18 — 2026-08-20 (the CDN guard never ran on a CSF host)
+
+`webserver_guard_apply` — both rc16's nginx side and rc17's LiteSpeed side — was called from inside
+the non-CSF branch of `logwall firewall apply`, right next to `setup_iptables_chains`. Reasonable
+by proximity, wrong by dependency: which kernel backend enforces the blacklist (ipset chains vs
+`csf -d`) has nothing to do with whether the webserver also needs to enforce it, and CSF hosts
+never took the non-CSF branch at all. Found live on a CyberPanel/CSF host: `selftest` failed with
+"ENFORCE=1 but no vhost carries the webserver-layer guard" after an apply that reported success,
+because the call that would have written it never ran.
+
+Moved to run once, after both branches, unconditionally. No config change, no new setting — the
+call was simply in the wrong place since the moment it was written.
+
 ## 1.0.0-rc17 — 2026-08-20 (three wrong mechanisms before the one that worked)
 
 ### The nginx-layer guard was nginx-only; the gap it closes is not

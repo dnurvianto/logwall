@@ -305,16 +305,19 @@ cmd_apply() {
         # Whitelist is installed before the blacklist can ever match.
         setup_iptables_chains "$ENFORCE"
 
-        # Second enforcement point: iptables can only match a packet's real
-        # source, which behind a CDN is always the edge, never the attacker.
-        # This checks the address nginx's own realip module already recovered.
-        webserver_guard_apply "$ENFORCE"
-
         if [ "$ENFORCE" != "1" ]; then
             say "[INFO] ENFORCE=0 — sets populated for review, no traffic is being dropped."
             say "[INFO] Inspect: ipset list ${SET_BLACK4}   then set ENFORCE=1 in ${CONF_FILE}."
         fi
     fi
+
+    # Second enforcement point: iptables/CSF can only match a packet's real
+    # source, which behind a CDN is always the edge, never the attacker. This
+    # checks the address the webserver's own realip recovery already found —
+    # orthogonal to which kernel backend is in use, so it runs in every mode,
+    # CSF included. Found live on a CSF/CyberPanel host: nested inside the
+    # non-CSF branch above, this never ran there at all.
+    webserver_guard_apply "$ENFORCE"
 
     if ! verify_admin_connectivity "$sessions_before"; then
         echo "[ERROR] Connectivity check failed — rolling back to ${snapshot_id}." >&2
