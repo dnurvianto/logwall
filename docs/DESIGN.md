@@ -1210,7 +1210,42 @@ A panel with its own firewall (CSF, a panel firewalld, a bundled fail2ban) is **
 over. logwall adapts to it (§8.B) or reports the conflict (§8.E) — two L3 agents flushing each
 other is the hardest kind of downtime to diagnose.
 
-### D. Explicitly NOT Supported
+### D. Webserver-Layer Enforcement (`webserver_guard.sh`, §8.F) — a separate matrix from detection above
+
+The table in §20.B answers "can logwall read this webserver's logs and detect an attacker." It
+says nothing about §8.F's second question — "once detected, can logwall actually make this
+webserver drop the request," which only matters when a packet's real source is hidden from
+iptables (behind a CDN, or any proxy the webserver trusts for `X-Forwarded-For`). The two
+questions have different answers per environment, and conflating them once already produced a
+wrong call in the field: a webserver-layer gap was dismissed as low-priority by reasoning "it only
+matters behind a CDN," when the actual criterion is "is there a real site here at all" — the guard
+protects every vhost it reaches, CDN or not, the same way the dual-protection whitelist (§8.A1)
+protects the kernel side regardless of *why* an address needed blocking.
+
+This tiering is stricter than §20.B's: **Live** means blocked-then-unblocked with a real `curl`
+against a real vhost in this project's own history, not just "the code path exists."
+
+| Webserver + Panel combination | Status | Evidence |
+|---|---|---|
+| nginx + FastPanel | **Live** | Auto-wired via `fastpanel2-includes/*.conf`; `403`→`200` verified on bangkalan-vps |
+| nginx + no panel | **Live**, manual step | Guard file written and works, but reaching it needs one `include` line added by hand per vhost — no safe generic way to locate/edit an arbitrary hand-built vhost |
+| OpenLiteSpeed + CyberPanel | **Live** | Per-domain `vhost.conf`; `RewriteCond`/`RewriteRule` regex alternation; `403`→`200` verified on ovh-vps after two other mechanisms (`accessControl`, `RewriteMap`) failed live first |
+| OpenLiteSpeed + DirectAdmin | **Not built** | Different config layout entirely (no per-domain `vhost.conf`; DirectAdmin's own docs point to a combined `httpd-vhosts.conf` that did not exist on the one host checked — likely because that host has no real vhost yet). Confirmed present, confirmed silent no-op: `WEBSERVER_ENFORCE=1` installs nothing there today, and nothing breaks either |
+| Apache (any panel) | **Not built** | No code path. `Require ip`/`Require not ip` (`mod_authz_core`) is the likely mechanism — standard, well-documented, lower-risk than LiteSpeed's dialect — but unverified until built against a real Apache host |
+| Caddy (any panel) | **Not built** | No code path |
+| cPanel + LiteSpeed Enterprise | **Not built, not checked** | Distinct again from the CyberPanel and DirectAdmin integrations above; no host in this fleet confirmed to run it yet |
+
+**No webserver at all (confirmed on pmg-vps — no nginx, no LiteSpeed, no Apache running, nothing
+listening on 80/443):** `webserver_guard_apply` detects nothing and installs nothing — correctly
+inert, not a failure. logwall is **not useless** on such a host, but its scope narrows to what
+§20.B's log-based detection never depended on a webserver for in the first place: failed SSH /
+IMAP / POP3 / SMTP / FTP logins (`LOGIN_FAIL_BLOCK`) and panel-401/403 attempts still get detected
+and blocked at the kernel layer exactly as on any other host. What disappears is everything HTTP-
+specific — WordPress/XML-RPC brute force, sensitive-file scanning, request-volume floods — because
+there is no access log to read. Run `logwall doctor` to see `panel=none` stated plainly rather than
+guessed at.
+
+### E. Explicitly NOT Supported
 
 - Windows Server / IIS — out of scope, no code path exists.
 - FreeBSD / OPNsense (pf, not netfilter) — an entirely different firewall architecture.
