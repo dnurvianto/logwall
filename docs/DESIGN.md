@@ -1228,7 +1228,7 @@ against a real vhost in this project's own history, not just "the code path exis
 | Webserver + Panel combination | Status | Evidence |
 |---|---|---|
 | nginx + FastPanel | **Live** | Auto-wired via `fastpanel2-includes/*.conf`; `403`→`200` verified on bangkalan-vps |
-| nginx + no panel | **Live**, manual step | Guard file written and works, but reaching it needs one `include` line added by hand per vhost — no safe generic way to locate/edit an arbitrary hand-built vhost |
+| nginx + no panel | **Code complete, not live-tested** | Same `geo`/`if`/`403` mechanism the FastPanel row verified live, and file generation is covered by an offline test — but nobody has actually added the manual `include` line to a real no-panel vhost and confirmed `403` there. Reaching it needs that one line added by hand per vhost — no safe generic way to locate/edit an arbitrary hand-built vhost |
 | OpenLiteSpeed + CyberPanel | **Live** | Per-domain `vhost.conf`; `RewriteCond`/`RewriteRule` regex alternation; `403`→`200` verified on ovh-vps after two other mechanisms (`accessControl`, `RewriteMap`) failed live first |
 | OpenLiteSpeed + DirectAdmin | **Not built** | Different config layout entirely (no per-domain `vhost.conf`; DirectAdmin's own docs point to a combined `httpd-vhosts.conf` that did not exist on the one host checked — likely because that host has no real vhost yet). Confirmed present, confirmed silent no-op: `WEBSERVER_ENFORCE=1` installs nothing there today, and nothing breaks either |
 | Apache (any panel) | **Not built** | No code path. `Require ip`/`Require not ip` (`mod_authz_core`) is the likely mechanism — standard, well-documented, lower-risk than LiteSpeed's dialect — but unverified until built against a real Apache host |
